@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,128 +17,99 @@ limitations under the License.
 package reconciler
 
 import (
-	"context"
-	"log"
+	context "context"
+	"fmt"
+	"strings"
 
-	camelv1alpha1 "github.com/apache/camel-k/pkg/apis/camel/v1alpha1"
-	"go.uber.org/zap"
+	camelv1 "github.com/apache/camel-k/pkg/apis/camel/v1"
+	camelclientset "github.com/apache/camel-k/pkg/client/clientset/versioned"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/tools/record"
-	"knative.dev/eventing-contrib/camel/source/pkg/apis/sources/v1alpha1"
+	v1alpha1 "knative.dev/eventing-contrib/camel/source/pkg/apis/sources/v1alpha1"
 	"knative.dev/eventing-contrib/camel/source/pkg/reconciler/resources"
-	"knative.dev/eventing-contrib/pkg/controller/sdk"
-	"knative.dev/eventing-contrib/pkg/controller/sinks"
 	"knative.dev/pkg/logging"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"knative.dev/pkg/reconciler"
+	"knative.dev/pkg/resolver"
+
+	camelsource "knative.dev/eventing-contrib/camel/source/pkg/client/injection/reconciler/sources/v1alpha1/camelsource"
 )
 
-const (
-	// controllerAgentName is the string used by this controller to identify
-	// itself when creating events.
-	controllerAgentName = "camel-source-controller"
-)
-
-// Add creates a new CamelSource Controller and adds it to the Manager with
-// default RBAC. The Manager will set fields on the Controller and Start it when
-// the Manager is Started.
-func Add(mgr manager.Manager, logger *zap.SugaredLogger) error {
-	log.Println("Adding the Camel Source controller.")
-
-	// Register Camel specific types
-	mgr.GetScheme().AddKnownTypes(camelv1alpha1.SchemeGroupVersion, &camelv1alpha1.Integration{}, &camelv1alpha1.IntegrationList{})
-	mgr.GetScheme().AddKnownTypes(camelv1alpha1.SchemeGroupVersion, &camelv1alpha1.IntegrationKit{}, &camelv1alpha1.IntegrationKitList{})
-	mgr.GetScheme().AddKnownTypes(camelv1alpha1.SchemeGroupVersion, &camelv1alpha1.IntegrationPlatform{}, &camelv1alpha1.IntegrationPlatformList{})
-	metav1.AddToGroupVersion(mgr.GetScheme(), camelv1alpha1.SchemeGroupVersion)
-
-	p := &sdk.Provider{
-		AgentName: controllerAgentName,
-		Parent:    &v1alpha1.CamelSource{},
-		Owns:      []runtime.Object{&camelv1alpha1.Integration{}},
-		Reconciler: &reconciler{
-			recorder: mgr.GetRecorder(controllerAgentName),
-			scheme:   mgr.GetScheme(),
-		},
-	}
-
-	err := p.Add(mgr, logger)
-	if err != nil {
-		log.Println("Camel K cluster resources not installed correctly. Follow installation instructions at: https://github.com/apache/camel-k")
-	}
-	return err
+// newReconciledNormal makes a new reconciler event with event type Normal, and
+// reason CamelSourceReconciled.
+func newReconciledNormal(namespace, name string) reconciler.Event {
+	return reconciler.NewEvent(corev1.EventTypeNormal, "CamelSourceReconciled", "CamelSource reconciled: \"%s/%s\"", namespace, name)
 }
 
-type reconciler struct {
-	client   client.Client
-	scheme   *runtime.Scheme
-	recorder record.EventRecorder
+// Reconciler implements controller.Reconciler for CamelSource resources.
+type Reconciler struct {
+	sinkResolver   *resolver.URIResolver
+	camelClientSet camelclientset.Interface
 }
 
-// A CamelSource delegates the task of starting up the required containers to a Camel K Integration resource, that
-// is managed by the Camel K operator (https://github.com/apache/camel-k).
+// Check that our Reconciler implements Interface
+var _ camelsource.Interface = (*Reconciler)(nil)
 
-// The Camel K operator is installed with Camel sources and requires a namespace-scoped IntegrationPlatform resource
-// containing the global configuration. An IntegrationPlatform with a default configuration suitable for Knative is
-// created by the reconcile loop if not present in the namespace of the CamelSource.
-
-// When the CamelSource declares a specific image as starting point, the image is imported by the reconcile loop into an
-// IntegrationContext. An IntegrationContext is a Camel K specific resource containing references to images and
-// Camel-specific configuration.
-// When no specific image is requested by the user, the Camel K operator will figure out how to construct an IntegrationContext.
-
-// Reconcile compares the actual state with the desired, and attempts to converge the two.
-func (r *reconciler) Reconcile(ctx context.Context, object runtime.Object) error {
-	logger := logging.FromContext(ctx)
-
-	source, ok := object.(*v1alpha1.CamelSource)
-	if !ok {
-		logger.Errorf("could not find camel source %v", object)
-		return nil
-	}
-
-	// No need to reconcile if the source has been marked for deletion.
-	deletionTimestamp := source.GetDeletionTimestamp()
-	if deletionTimestamp != nil {
-		return nil
-	}
-
-	source.Status.ObservedGeneration = source.Generation
+// ReconcileKind implements Interface.ReconcileKind.
+func (r *Reconciler) ReconcileKind(ctx context.Context, source *v1alpha1.CamelSource) reconciler.Event {
 	source.Status.InitializeConditions()
+	source.Status.ObservedGeneration = source.Generation
 
-	sinkURI, err := sinks.GetSinkURI(ctx, r.client, source.Spec.Sink, source.Namespace)
+	if source.Spec.Sink == nil {
+		source.Status.MarkNoSink("SinkMissing", "")
+		return fmt.Errorf("spec.sink missing")
+	}
+
+	dest := source.Spec.Sink.DeepCopy()
+	// fill optional data in destination
+	if dest.Ref != nil {
+		if dest.Ref.Namespace == "" {
+			dest.Ref.Namespace = source.GetNamespace()
+		}
+	} else if dest.DeprecatedName != "" && dest.DeprecatedNamespace == "" {
+		dest.DeprecatedNamespace = source.GetNamespace()
+	}
+
+	sinkURI, err := r.sinkResolver.URIFromDestination(*dest, source)
 	if err != nil {
 		source.Status.MarkNoSink("NotFound", "")
 		return err
 	}
-	source.Status.MarkSink(sinkURI)
 
-	integration, err := r.reconcileIntegration(ctx, source, sinkURI)
-	if err != nil {
-		return err
+	if dest.DeprecatedAPIVersion != "" &&
+		dest.DeprecatedKind != "" &&
+		dest.DeprecatedName != "" {
+		source.Status.MarkSinkWarnRefDeprecated(sinkURI)
+	} else {
+		source.Status.MarkSink(sinkURI)
 	}
 
-	// Update source status
-	if integration != nil && integration.Status.Phase == camelv1alpha1.IntegrationPhaseRunning {
+	// Reconcile and update integration status
+	if integration, err := r.reconcileIntegration(ctx, source, sinkURI); err != nil {
+		return err
+	} else if integration != nil && integration.Status.Phase == camelv1.IntegrationPhaseRunning {
 		source.Status.MarkDeployed()
 	}
 
-	return nil
+	return newReconciledNormal(source.Namespace, source.Name)
 }
 
-func (r *reconciler) reconcileIntegration(ctx context.Context, source *v1alpha1.CamelSource, sinkURI string) (*camelv1alpha1.Integration, error) {
+func (r *Reconciler) reconcileIntegration(ctx context.Context, source *v1alpha1.CamelSource, sinkURI string) (*camelv1.Integration, reconciler.Event) {
 	logger := logging.FromContext(ctx)
 	args := &resources.CamelArguments{
 		Name:      source.Name,
 		Namespace: source.Namespace,
 		Source:    source.Spec.Source,
-		Sink:      sinkURI,
+		Owner:     source,
+		SinkURL:   sinkURI,
+	}
+	if source.Spec.CloudEventOverrides != nil {
+		args.Overrides = make(map[string]string)
+		for k, v := range source.Spec.CloudEventOverrides.Extensions {
+			args.Overrides[strings.ToLower(k)] = v
+		}
 	}
 
 	integration, err := r.getIntegration(ctx, source)
@@ -146,15 +117,18 @@ func (r *reconciler) reconcileIntegration(ctx context.Context, source *v1alpha1.
 		if k8serrors.IsNotFound(err) {
 			integration, err = r.createIntegration(ctx, source, args)
 			if err != nil {
-				r.recorder.Eventf(source, corev1.EventTypeWarning, "IntegrationBlocked", "waiting for %v", err)
-				return nil, err
+				return nil, reconciler.NewEvent(corev1.EventTypeWarning, "IntegrationBlocked", "waiting for %v", err)
 			}
-			r.recorder.Eventf(source, corev1.EventTypeNormal, "Deployed", "Created integration %q", integration.Name)
-			source.Status.MarkDeploying("Deploying", "Created integration %s", integration.Name)
+
 			// Since the Deployment has just been created, there's nothing more
 			// to do until it gets a status. This CamelSource will be reconciled
 			// again when the Integration is updated.
-			return integration, nil
+			name := integration.Name
+			if name == "" {
+				name = fmt.Sprintf("%s*", integration.GenerateName)
+			}
+			source.Status.MarkDeploying("Deploying", "Created integration %s", name)
+			return integration, reconciler.NewEvent(corev1.EventTypeNormal, "Deployed", "Created integration %q", name)
 		}
 		return nil, err
 	}
@@ -170,100 +144,46 @@ func (r *reconciler) reconcileIntegration(ctx context.Context, source *v1alpha1.
 	if !equality.Semantic.DeepDerivative(expected.Spec, integration.Spec) {
 		logger.Infof("Integration %q in namespace %q has changed and needs to be updated", integration.Name, integration.Namespace)
 		integration.Spec = expected.Spec
-		err := r.client.Update(ctx, integration)
+
+		_, err := r.updateIntegration(ctx, integration)
 		// if no error, update the status.
-		if err == nil {
-			r.recorder.Eventf(source, corev1.EventTypeNormal, "Deployed", "Updated integration %q", integration.Name)
-			source.Status.MarkDeploying("IntegrationUpdated", "Updated integration %s", integration.Name)
-		} else {
-			source.Status.MarkDeploying("IntegrationNeedsUpdate", "Attempting to update integration %s", integration.Name)
-			r.recorder.Eventf(source, corev1.EventTypeWarning, "IntegrationNeedsUpdate", "Failed to update integration %q", integration.Name)
+		name := integration.Name
+		if name == "" {
+			name = fmt.Sprintf("%s*", integration.GenerateName)
 		}
-		// Return after this update or error and reconcile again
-		return nil, err
+		if err == nil {
+			source.Status.MarkDeploying("IntegrationUpdated", "Updated integration %s", name)
+			return nil, reconciler.NewEvent(corev1.EventTypeNormal, "IntegrationUpdated", "Updated integration %q", name)
+		} else {
+			source.Status.MarkDeploying("IntegrationNeedsUpdate", "Attempting to update integration %s", name)
+			return nil, reconciler.NewEvent(corev1.EventTypeWarning, "IntegrationNeedsUpdate", "Failed to update integration %q", name)
+		}
 	}
 	return integration, nil
 }
 
-func (r *reconciler) getIntegration(ctx context.Context, source *v1alpha1.CamelSource) (*camelv1alpha1.Integration, error) {
-	logger := logging.FromContext(ctx)
-
-	list := &camelv1alpha1.IntegrationList{}
-	err := r.client.List(
-		ctx,
-		&client.ListOptions{
-			Namespace:     source.Namespace,
-			LabelSelector: labels.Everything(),
-			// TODO this is here because the fake client needs it.
-			// Remove this when it's no longer needed.
-			Raw: &metav1.ListOptions{
-				TypeMeta: metav1.TypeMeta{
-					APIVersion: camelv1alpha1.SchemeGroupVersion.String(),
-					Kind:       "Integration",
-				},
-			},
-		},
-		list)
+func (r *Reconciler) getIntegration(ctx context.Context, source *v1alpha1.CamelSource) (*camelv1.Integration, error) {
+	all, err := r.camelClientSet.CamelV1().Integrations(source.Namespace).List(metav1.ListOptions{})
 	if err != nil {
-		logger.Errorw("Unable to list integrations", zap.Error(err))
 		return nil, err
 	}
-	for _, c := range list.Items {
-		if metav1.IsControlledBy(&c, source) {
-			return &c, nil
+	for _, a := range all.Items {
+		if metav1.IsControlledBy(&a, source) {
+			return &a, nil
 		}
 	}
 	return nil, k8serrors.NewNotFound(schema.GroupResource{}, "")
 }
 
-func (r *reconciler) createIntegration(ctx context.Context, source *v1alpha1.CamelSource, args *resources.CamelArguments) (*camelv1alpha1.Integration, error) {
+func (r *Reconciler) createIntegration(ctx context.Context, source *v1alpha1.CamelSource, args *resources.CamelArguments) (*camelv1.Integration, error) {
 	integration, err := resources.MakeIntegration(args)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := controllerutil.SetControllerReference(source, integration, r.scheme); err != nil {
-		return nil, err
-	}
-
-	if err := r.client.Create(ctx, integration); err != nil {
-		return nil, err
-	}
-	return integration, nil
+	return r.camelClientSet.CamelV1().Integrations(source.Namespace).Create(integration)
 }
 
-func (r *reconciler) getIntegrationContext(ctx context.Context, namespace string, image string) (*camelv1alpha1.IntegrationKit, error) {
-	logger := logging.FromContext(ctx)
-
-	list := &camelv1alpha1.IntegrationKitList{}
-	err := r.client.List(
-		ctx,
-		&client.ListOptions{
-			Namespace:     namespace,
-			LabelSelector: labels.Everything(),
-			// TODO this is here because the fake client needs it.
-			// Remove this when it's no longer needed.
-			Raw: &metav1.ListOptions{
-				TypeMeta: metav1.TypeMeta{
-					APIVersion: camelv1alpha1.SchemeGroupVersion.String(),
-					Kind:       "IntegrationKit",
-				},
-			},
-		},
-		list)
-	if err != nil {
-		logger.Errorw("Unable to list integration contexts", zap.Error(err))
-		return nil, err
-	}
-	for _, c := range list.Items {
-		if c.Spec.Image == image {
-			return &c, nil
-		}
-	}
-	return nil, k8serrors.NewNotFound(schema.GroupResource{}, "")
-}
-
-func (r *reconciler) InjectClient(c client.Client) error {
-	r.client = c
-	return nil
+func (r *Reconciler) updateIntegration(ctx context.Context, integration *camelv1.Integration) (*camelv1.Integration, error) {
+	return r.camelClientSet.CamelV1().Integrations(integration.Namespace).Update(integration)
 }

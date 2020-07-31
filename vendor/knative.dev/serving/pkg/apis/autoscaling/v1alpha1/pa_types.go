@@ -19,13 +19,14 @@ package v1alpha1
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	net "knative.dev/networking/pkg/apis/networking"
 	"knative.dev/pkg/apis"
-	duckv1beta1 "knative.dev/pkg/apis/duck/v1beta1"
+	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"knative.dev/pkg/kmeta"
-	net "knative.dev/serving/pkg/apis/networking"
 )
 
 // +genclient
+// +genreconciler:class=autoscaling.knative.dev/class
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // PodAutoscaler is a Knative abstraction that encapsulates the interface by which Knative
@@ -54,6 +55,9 @@ var (
 
 	// Check that we can create OwnerReferences to a PodAutoscaler.
 	_ kmeta.OwnerRefable = (*PodAutoscaler)(nil)
+
+	// Check that the type conforms to the duck Knative Resource shape.
+	_ duckv1.KRShaped = (*PodAutoscaler)(nil)
 )
 
 // ReachabilityType is the enumeration type for the different states of reachability
@@ -68,7 +72,7 @@ const (
 	// ReachabilityReachable means the `ScaleTarget` is reachable, ie. it has an active route.
 	ReachabilityReachable ReachabilityType = "Reachable"
 
-	// ReachabilityReachable means the `ScaleTarget` is not reachable, ie. it does not have an active route.
+	// ReachabilityUnreachable means the `ScaleTarget` is not reachable, ie. it does not have an active route.
 	ReachabilityUnreachable ReachabilityType = "Unreachable"
 )
 
@@ -80,7 +84,7 @@ type PodAutoscalerSpec struct {
 	// This property will be dropped in future Knative releases and should
 	// not be used - use metadata.generation
 	//
-	// Tracking issue: https://knative.dev/serving/issues/643
+	// Tracking issue: https://github.com/knative/serving/issues/643
 	//
 	// +optional
 	DeprecatedGeneration int64 `json:"generation,omitempty"`
@@ -100,10 +104,6 @@ type PodAutoscalerSpec struct {
 	// +optional
 	Reachability ReachabilityType `json:"reachability,omitempty"`
 
-	// DeprecatedServiceName holds the name of a core Kubernetes Service resource that
-	// load balances over the pods referenced by the ScaleTargetRef.
-	DeprecatedServiceName string `json:"serviceName"`
-
 	// The application-layer protocol. Matches `ProtocolType` inferred from the revision spec.
 	ProtocolType net.ProtocolType `json:"protocolType"`
 }
@@ -112,13 +112,18 @@ const (
 	// PodAutoscalerConditionReady is set when the revision is starting to materialize
 	// runtime resources, and becomes true when those resources are ready.
 	PodAutoscalerConditionReady = apis.ConditionReady
+	// PodAutoscalerConditionScaleTargetInitialized is set when the PodAutoscaler's
+	// ScaleTargetRef was ready to serve traffic once.
+	PodAutoscalerConditionScaleTargetInitialized apis.ConditionType = "ScaleTargetInitialized"
 	// PodAutoscalerConditionActive is set when the PodAutoscaler's ScaleTargetRef is receiving traffic.
 	PodAutoscalerConditionActive apis.ConditionType = "Active"
+	// PodAutoscalerCondtionDependenciesReady is set when SKS is ready.
+	PodAutoscalerSKSReady = "SKSReady"
 )
 
 // PodAutoscalerStatus communicates the observed state of the PodAutoscaler (from the controller).
 type PodAutoscalerStatus struct {
-	duckv1beta1.Status
+	duckv1.Status `json:",inline"`
 
 	// ServiceName is the K8s Service name that serves the revision, scaled by this PA.
 	// The service is created and owned by the ServerlessService object owned by this PA.
@@ -143,4 +148,9 @@ type PodAutoscalerList struct {
 	metav1.ListMeta `json:"metadata"`
 
 	Items []PodAutoscaler `json:"items"`
+}
+
+// GetStatus retrieves the status of the PodAutoscaler. Implements the KRShaped interface.
+func (t *PodAutoscaler) GetStatus() *duckv1.Status {
+	return &t.Status.Status
 }

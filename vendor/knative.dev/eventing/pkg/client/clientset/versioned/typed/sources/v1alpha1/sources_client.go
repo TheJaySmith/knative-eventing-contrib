@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,6 @@ limitations under the License.
 package v1alpha1
 
 import (
-	serializer "k8s.io/apimachinery/pkg/runtime/serializer"
 	rest "k8s.io/client-go/rest"
 	v1alpha1 "knative.dev/eventing/pkg/apis/sources/v1alpha1"
 	"knative.dev/eventing/pkg/client/clientset/versioned/scheme"
@@ -28,11 +27,11 @@ import (
 type SourcesV1alpha1Interface interface {
 	RESTClient() rest.Interface
 	ApiServerSourcesGetter
-	ContainerSourcesGetter
-	CronJobSourcesGetter
+	PingSourcesGetter
+	SinkBindingsGetter
 }
 
-// SourcesV1alpha1Client is used to interact with features provided by the sources.eventing.knative.dev group.
+// SourcesV1alpha1Client is used to interact with features provided by the sources.knative.dev group.
 type SourcesV1alpha1Client struct {
 	restClient rest.Interface
 }
@@ -41,12 +40,12 @@ func (c *SourcesV1alpha1Client) ApiServerSources(namespace string) ApiServerSour
 	return newApiServerSources(c, namespace)
 }
 
-func (c *SourcesV1alpha1Client) ContainerSources(namespace string) ContainerSourceInterface {
-	return newContainerSources(c, namespace)
+func (c *SourcesV1alpha1Client) PingSources(namespace string) PingSourceInterface {
+	return newPingSources(c, namespace)
 }
 
-func (c *SourcesV1alpha1Client) CronJobSources(namespace string) CronJobSourceInterface {
-	return newCronJobSources(c, namespace)
+func (c *SourcesV1alpha1Client) SinkBindings(namespace string) SinkBindingInterface {
+	return newSinkBindings(c, namespace)
 }
 
 // NewForConfig creates a new SourcesV1alpha1Client for the given config.
@@ -81,7 +80,7 @@ func setConfigDefaults(config *rest.Config) error {
 	gv := v1alpha1.SchemeGroupVersion
 	config.GroupVersion = &gv
 	config.APIPath = "/apis"
-	config.NegotiatedSerializer = serializer.DirectCodecFactory{CodecFactory: scheme.Codecs}
+	config.NegotiatedSerializer = scheme.Codecs.WithoutConversion()
 
 	if config.UserAgent == "" {
 		config.UserAgent = rest.DefaultKubernetesUserAgent()

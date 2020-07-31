@@ -20,12 +20,9 @@ import (
 	"context"
 	"flag"
 	"log"
+	"os"
 
-	"knative.dev/eventing-contrib/pkg/kncloudevents"
-
-	"github.com/cloudevents/sdk-go/pkg/cloudevents"
-	"github.com/cloudevents/sdk-go/pkg/cloudevents/types"
-
+	cloudevents "github.com/cloudevents/sdk-go/v2"
 	"github.com/gorilla/websocket"
 )
 
@@ -48,6 +45,11 @@ func init() {
 func main() {
 	flag.Parse()
 
+	k_sink := os.Getenv("K_SINK")
+	if k_sink != "" {
+		sink = k_sink
+	}
+
 	// "source" flag must not be empty for operation.
 	if source == "" {
 		log.Fatal("A valid source url must be defined.")
@@ -58,7 +60,7 @@ func main() {
 		eventSource = source
 	}
 
-	ce, err := kncloudevents.NewDefaultClient(sink)
+	ce, err := cloudevents.NewDefaultClient()
 	if err != nil {
 		log.Fatalf("Failed to create a http cloudevent client: %s", err.Error())
 	}
@@ -68,6 +70,8 @@ func main() {
 		log.Fatal("error connecting:", err)
 	}
 
+	ctx := cloudevents.ContextWithTarget(context.Background(), sink)
+
 	for {
 		_, message, err := ws.ReadMessage()
 		if err != nil {
@@ -76,15 +80,12 @@ func main() {
 			return
 		}
 
-		event := cloudevents.Event{
-			Context: cloudevents.EventContextV02{
-				Type:   eventType,
-				Source: *types.ParseURLRef(eventSource),
-			}.AsV02(),
-			Data: message,
-		}
-		if _, _, err := ce.Send(context.TODO(), event); err != nil {
-			log.Printf("sending event to channel failed: %v", err)
+		event := cloudevents.NewEvent(cloudevents.VersionV1)
+		event.SetType(eventType)
+		event.SetSource(eventSource)
+		_ = event.SetData(cloudevents.ApplicationJSON, message)
+		if result := ce.Send(ctx, event); !cloudevents.IsACK(result) {
+			log.Printf("sending event to channel failed: %v", result)
 		}
 	}
 }

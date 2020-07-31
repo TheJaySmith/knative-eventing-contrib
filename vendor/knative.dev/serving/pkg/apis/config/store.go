@@ -20,6 +20,7 @@ import (
 	"context"
 
 	"knative.dev/pkg/configmap"
+	autoscalerconfig "knative.dev/serving/pkg/autoscaler/config"
 )
 
 type cfgKey struct{}
@@ -27,7 +28,9 @@ type cfgKey struct{}
 // Config holds the collection of configurations that we attach to contexts.
 // +k8s:deepcopy-gen=false
 type Config struct {
-	Defaults *Defaults
+	Defaults   *Defaults
+	Features   *Features
+	Autoscaler *autoscalerconfig.Config
 }
 
 // FromContext extracts a Config from the provided context.
@@ -42,13 +45,23 @@ func FromContext(ctx context.Context) *Config {
 // FromContextOrDefaults is like FromContext, but when no Config is attached it
 // returns a Config populated with the defaults for each of the Config fields.
 func FromContextOrDefaults(ctx context.Context) *Config {
-	if cfg := FromContext(ctx); cfg != nil {
-		return cfg
+	cfg := FromContext(ctx)
+	if cfg == nil {
+		cfg = &Config{}
 	}
-	defaults, _ := NewDefaultsConfigFromMap(map[string]string{})
-	return &Config{
-		Defaults: defaults,
+
+	if cfg.Defaults == nil {
+		cfg.Defaults, _ = NewDefaultsConfigFromMap(map[string]string{})
 	}
+
+	if cfg.Features == nil {
+		cfg.Features, _ = NewFeaturesConfigFromMap(map[string]string{})
+	}
+
+	if cfg.Autoscaler == nil {
+		cfg.Autoscaler, _ = autoscalerconfig.NewConfigFromMap(map[string]string{})
+	}
+	return cfg
 }
 
 // ToContext attaches the provided Config to the provided context, returning the
@@ -67,10 +80,12 @@ type Store struct {
 func NewStore(logger configmap.Logger, onAfterStore ...func(name string, value interface{})) *Store {
 	store := &Store{
 		UntypedStore: configmap.NewUntypedStore(
-			"defaults",
+			"apis",
 			logger,
 			configmap.Constructors{
-				DefaultsConfigName: NewDefaultsConfigFromConfigMap,
+				DefaultsConfigName:          NewDefaultsConfigFromConfigMap,
+				FeaturesConfigName:          NewFeaturesConfigFromConfigMap,
+				autoscalerconfig.ConfigName: autoscalerconfig.NewConfigFromConfigMap,
 			},
 			onAfterStore...,
 		),
@@ -87,6 +102,8 @@ func (s *Store) ToContext(ctx context.Context) context.Context {
 // Load creates a Config from the current config state of the Store.
 func (s *Store) Load() *Config {
 	return &Config{
-		Defaults: s.UntypedLoad(DefaultsConfigName).(*Defaults).DeepCopy(),
+		Defaults:   s.UntypedLoad(DefaultsConfigName).(*Defaults).DeepCopy(),
+		Features:   s.UntypedLoad(FeaturesConfigName).(*Features).DeepCopy(),
+		Autoscaler: s.UntypedLoad(autoscalerconfig.ConfigName).(*autoscalerconfig.Config).DeepCopy(),
 	}
 }

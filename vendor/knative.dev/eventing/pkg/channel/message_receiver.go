@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 The Knative Authors
+ * Copyright 2020 The Knative Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,56 +17,80 @@
 package channel
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
-	"net/http"
-	"strings"
+	nethttp "net/http"
+	"time"
 
+	"github.com/cloudevents/sdk-go/v2/binding"
+	"github.com/cloudevents/sdk-go/v2/protocol/http"
 	"go.uber.org/zap"
-	"k8s.io/apimachinery/pkg/util/sets"
-	"knative.dev/pkg/tracing"
+
+	"knative.dev/pkg/network"
+
+	"knative.dev/eventing/pkg/kncloudevents"
+	"knative.dev/eventing/pkg/utils"
 )
 
-const (
-	// MessageReceiverPort is the port that MessageReceiver opens an HTTP server on.
-	MessageReceiverPort = 8080
-)
-
-// MessageReceiver starts a server to receive new messages for the channel dispatcher. The new
-// message is emitted via the receiver function.
-type MessageReceiver struct {
-	receiverFunc      func(ChannelReference, *Message) error
-	forwardHeaders    sets.String
-	forwardPrefixes   []string
-	logger            *zap.SugaredLogger
-	hostToChannelFunc ResolveChannelFromHostFunc
+// UnknownChannelError represents the error when an event is received by a channel dispatcher for a
+// channel that does not exist.
+type UnknownChannelError struct {
+	c ChannelReference
 }
 
-// ReceiverOptions provides functional options to MessageReceiver function.
-type ReceiverOptions func(*MessageReceiver) error
+func (e *UnknownChannelError) Error() string {
+	return fmt.Sprintf("unknown channel: %v", e.c)
+}
 
-// ResolveChannelFromHostFunc function enables MessageReceiver to get the Channel Reference from incoming request HostHeader
+// UnknownHostError represents the error when a ResolveMessageChannelFromHostHeader func cannot resolve an host
+type UnknownHostError string
+
+func (e UnknownHostError) Error() string {
+	return fmt.Sprintf("cannot map host to channel: %s", string(e))
+}
+
+// MessageReceiver starts a server to receive new events for the channel dispatcher. The new
+// event is emitted via the receiver function.
+type MessageReceiver struct {
+	httpBindingsReceiver *kncloudevents.HttpMessageReceiver
+	receiverFunc         UnbufferedMessageReceiverFunc
+	logger               *zap.Logger
+	hostToChannelFunc    ResolveChannelFromHostFunc
+}
+
+// UnbufferedMessageReceiverFunc is the function to be called for handling the message.
+// The provided message is not buffered, so it can't be safely read more times.
+// When you perform the write (or the buffering) of the Message, you must use the transformers provided as parameters.
+// This function is responsible for invoking Message.Finish().
+type UnbufferedMessageReceiverFunc func(context.Context, ChannelReference, binding.Message, []binding.Transformer, nethttp.Header) error
+
+// ReceiverOptions provides functional options to MessageReceiver function.
+type MessageReceiverOptions func(*MessageReceiver) error
+
+// ResolveChannelFromHostFunc function enables EventReceiver to get the Channel Reference from incoming request HostHeader
 // before calling receiverFunc.
+// Returns UnknownHostError if the channel is not found, otherwise returns a generic error.
 type ResolveChannelFromHostFunc func(string) (ChannelReference, error)
 
-// ResolveChannelFromHostHeader is a ReceiverOption for NewMessageReceiver which enables the caller to overwrite the
+// ResolveMessageChannelFromHostHeader is a ReceiverOption for NewMessageReceiver which enables the caller to overwrite the
 // default behaviour defined by ParseChannel function.
-func ResolveChannelFromHostHeader(hostToChannelFunc ResolveChannelFromHostFunc) ReceiverOptions {
+func ResolveMessageChannelFromHostHeader(hostToChannelFunc ResolveChannelFromHostFunc) MessageReceiverOptions {
 	return func(r *MessageReceiver) error {
 		r.hostToChannelFunc = hostToChannelFunc
 		return nil
 	}
 }
 
-// NewMessageReceiver creates a message receiver passing new messages to the
+// NewMessageReceiver creates an event receiver passing new events to the
 // receiverFunc.
-func NewMessageReceiver(receiverFunc func(ChannelReference, *Message) error, logger *zap.SugaredLogger, opts ...ReceiverOptions) (*MessageReceiver, error) {
+func NewMessageReceiver(receiverFunc UnbufferedMessageReceiverFunc, logger *zap.Logger, opts ...MessageReceiverOptions) (*MessageReceiver, error) {
+	bindingsReceiver := kncloudevents.NewHttpMessageReceiver(8080)
 	receiver := &MessageReceiver{
-		receiverFunc:      receiverFunc,
-		forwardHeaders:    sets.NewString(forwardHeaders...),
-		forwardPrefixes:   forwardPrefixes,
-		hostToChannelFunc: ResolveChannelFromHostFunc(ParseChannel),
-		logger:            logger,
+		httpBindingsReceiver: bindingsReceiver,
+		receiverFunc:         receiverFunc,
+		hostToChannelFunc:    ResolveChannelFromHostFunc(ParseChannel),
+		logger:               logger,
 	}
 	for _, opt := range opts {
 		if err := opt(receiver); err != nil {
@@ -76,144 +100,90 @@ func NewMessageReceiver(receiverFunc func(ChannelReference, *Message) error, log
 	return receiver, nil
 }
 
-// Start begings to receive messages for the receiver.
+// Start begins to receive events for the receiver.
 //
 // Only HTTP POST requests to the root path (/) are accepted. If other paths or
 // methods are needed, use the HandleRequest method directly with another HTTP
 // server.
-//
-// This method will block until a message is received on the stop channel.
-func (r *MessageReceiver) Start(stopCh <-chan struct{}) error {
-	svr := r.start()
-	defer r.stop(svr)
+func (r *MessageReceiver) Start(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	<-stopCh
-	return nil
-}
-
-func (r *MessageReceiver) start() *http.Server {
-	r.logger.Info("Starting web server")
-	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", MessageReceiverPort),
-		Handler: r.handler(),
-	}
+	errCh := make(chan error, 1)
 	go func() {
-		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-			r.logger.Errorf("HTTPServer: ListenAndServe() error: %v", err)
-		}
+		errCh <- r.httpBindingsReceiver.StartListen(ctx, r)
 	}()
-	return srv
-}
 
-func (r *MessageReceiver) stop(srv *http.Server) {
-	r.logger.Info("Shutdown web server")
-	if err := srv.Shutdown(nil); err != nil {
-		r.logger.Fatal(err)
+	// Stop either if the receiver stops (sending to errCh) or if the context Done channel is closed.
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		break
+	}
+
+	// Done channel has been closed, we need to gracefully shutdown r.ceClient. The cancel() method will start its
+	// shutdown, if it hasn't finished in a reasonable amount of time, just return an error.
+	cancel()
+	select {
+	case err := <-errCh:
+		return err
+	case <-time.After(network.DefaultDrainTimeout):
+		return errors.New("timeout shutting down http bindings receiver")
 	}
 }
 
-// handler creates the http.Handler used by the http.Server started in MessageReceiver.Run.
-func (r *MessageReceiver) handler() http.Handler {
-	return tracing.HTTPSpanMiddleware(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
-		if req.URL.Path != "/" {
-			res.WriteHeader(http.StatusNotFound)
-			return
-		}
-		if req.Method != http.MethodPost {
-			res.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
+func (r *MessageReceiver) ServeHTTP(response nethttp.ResponseWriter, request *nethttp.Request) {
+	if request.Method != nethttp.MethodPost {
+		response.WriteHeader(nethttp.StatusMethodNotAllowed)
+		return
+	}
 
-		r.HandleRequest(res, req)
-	}))
-}
+	// tctx.URI is actually the path...
+	if request.URL.Path != "/" {
+		response.WriteHeader(nethttp.StatusNotFound)
+		return
+	}
 
-// HandleRequest is an http.Handler function. The request is converted to a
-// Message and emitted to the receiver func.
-//
-// The response status codes:
-//   202 - the message was sent to subscribers
-//   404 - the request was for an unknown channel
-//   500 - an error occurred processing the request
-func (r *MessageReceiver) HandleRequest(res http.ResponseWriter, req *http.Request) {
-	host := req.Host
-	r.logger.Infof("Received request for %s", host)
+	// The response status codes:
+	//   202 - the event was sent to subscribers
+	//   404 - the request was for an unknown channel
+	//   500 - an error occurred processing the request
+	host := request.Host
+	r.logger.Debug("Received request", zap.String("host", host))
 	channel, err := r.hostToChannelFunc(host)
 	if err != nil {
-		r.logger.Infow("Could not extract channel", zap.Error(err))
-		res.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	r.logger.Infof("Request mapped to channel: %s", channel.String())
-	message, err := r.fromRequest(req)
-	if err != nil {
-		res.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	// setting common channel information in the request
-	message.AppendToHistory(host)
-
-	err = r.receiverFunc(channel, message)
-	if err != nil {
-		if err == ErrUnknownChannel {
-			res.WriteHeader(http.StatusNotFound)
+		if _, ok := err.(UnknownHostError); ok {
+			response.WriteHeader(nethttp.StatusNotFound)
+			r.logger.Info(err.Error())
 		} else {
-			res.WriteHeader(http.StatusInternalServerError)
+			r.logger.Info("Could not extract channel", zap.Error(err))
+			response.WriteHeader(nethttp.StatusInternalServerError)
+		}
+		return
+	}
+	r.logger.Debug("Request mapped to channel", zap.String("channel", channel.String()))
+
+	message := http.NewMessageFromHttpRequest(request)
+
+	if message.ReadEncoding() == binding.EncodingUnknown {
+		r.logger.Info("Cannot determine the cloudevent message encoding")
+		response.WriteHeader(nethttp.StatusBadRequest)
+		return
+	}
+
+	err = r.receiverFunc(request.Context(), channel, message, []binding.Transformer{AddHistory(host)}, utils.PassThroughHeaders(request.Header))
+	if err != nil {
+		if _, ok := err.(*UnknownChannelError); ok {
+			response.WriteHeader(nethttp.StatusNotFound)
+		} else {
+			r.logger.Info("Error in receiver", zap.Error(err))
+			response.WriteHeader(nethttp.StatusInternalServerError)
 		}
 		return
 	}
 
-	res.WriteHeader(http.StatusAccepted)
+	response.WriteHeader(nethttp.StatusAccepted)
 }
 
-func (r *MessageReceiver) fromRequest(req *http.Request) (*Message, error) {
-	body, err := ioutil.ReadAll(req.Body)
-	if err != nil {
-		return nil, err
-	}
-	headers := r.fromHTTPHeaders(req.Header)
-	message := &Message{
-		Headers: headers,
-		Payload: body,
-	}
-	return message, nil
-}
-
-// fromHTTPHeaders converts HTTP headers into a message header map.
-//
-// Only headers whitelisted as safe are copied. If an HTTP header exists
-// multiple times, a single value will be retained.
-func (r *MessageReceiver) fromHTTPHeaders(headers http.Header) map[string]string {
-	safe := map[string]string{}
-
-	// TODO handle multi-value headers
-	for h, v := range headers {
-		// Headers are case-insensitive but test case are all lower-case
-		comparable := strings.ToLower(h)
-		if r.forwardHeaders.Has(comparable) {
-			safe[h] = v[0]
-			continue
-		}
-		for _, p := range r.forwardPrefixes {
-			if strings.HasPrefix(comparable, p) {
-				safe[h] = v[0]
-				break
-			}
-		}
-	}
-
-	return safe
-}
-
-// ParseChannel converts the channel's hostname into a channel
-// reference.
-func ParseChannel(host string) (ChannelReference, error) {
-	chunks := strings.Split(host, ".")
-	if len(chunks) < 2 {
-		return ChannelReference{}, fmt.Errorf("bad host format '%s'", host)
-	}
-	return ChannelReference{
-		Name:      chunks[0],
-		Namespace: chunks[1],
-	}, nil
-}
+var _ nethttp.Handler = (*MessageReceiver)(nil)

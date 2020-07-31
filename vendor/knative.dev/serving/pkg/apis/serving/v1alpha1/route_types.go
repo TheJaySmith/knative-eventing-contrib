@@ -20,11 +20,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"knative.dev/pkg/apis"
+	duckv1 "knative.dev/pkg/apis/duck/v1"
 	duckv1alpha1 "knative.dev/pkg/apis/duck/v1alpha1"
-	duckv1beta1 "knative.dev/pkg/apis/duck/v1beta1"
 	"knative.dev/pkg/kmeta"
 
-	"knative.dev/serving/pkg/apis/serving/v1beta1"
+	v1 "knative.dev/serving/pkg/apis/serving/v1"
 )
 
 // +genclient
@@ -35,7 +35,7 @@ import (
 // referencing the Configuration responsible for creating them; in these cases
 // the Route is additionally responsible for monitoring the Configuration for
 // "latest ready" revision changes, and smoothly rolling out latest revisions.
-// See also: https://knative.dev/serving/blob/master/docs/spec/overview.md#route
+// See also: https://github.com/knative/serving/blob/master/docs/spec/overview.md#route
 type Route struct {
 	metav1.TypeMeta `json:",inline"`
 	// +optional
@@ -61,6 +61,9 @@ var (
 
 	// Check that we can create OwnerReferences to a Route.
 	_ kmeta.OwnerRefable = (*Route)(nil)
+
+	// Check that the type conforms to the duck Knative Resource shape.
+	_ duckv1.KRShaped = (*Route)(nil)
 )
 
 // TrafficTarget holds a single entry of the routing table for a Route.
@@ -70,9 +73,9 @@ type TrafficTarget struct {
 	// +optional
 	DeprecatedName string `json:"name,omitempty"`
 
-	// We inherit most of our fields by inlining the v1beta1 type.
-	// Ultimately all non-v1beta1 fields will be deprecated.
-	v1beta1.TrafficTarget `json:",inline"`
+	// We inherit most of our fields by inlining the v1 type.
+	// Ultimately all non-v1 fields will be deprecated.
+	v1.TrafficTarget `json:",inline"`
 }
 
 // RouteSpec holds the desired state of the Route (from the client).
@@ -83,7 +86,7 @@ type RouteSpec struct {
 	// This property will be dropped in future Knative releases and should
 	// not be used - use metadata.generation
 	//
-	// Tracking issue: https://knative.dev/serving/issues/643
+	// Tracking issue: https://github.com/knative/serving/issues/643
 	//
 	// +optional
 	DeprecatedGeneration int64 `json:"generation,omitempty"`
@@ -104,7 +107,7 @@ const (
 	RouteConditionAllTrafficAssigned apis.ConditionType = "AllTrafficAssigned"
 
 	// RouteConditionIngressReady is set to False when the
-	// ClusterIngress fails to become Ready.
+	// Ingress fails to become Ready.
 	RouteConditionIngressReady apis.ConditionType = "IngressReady"
 
 	// RouteConditionCertificateProvisioned is set to False when the
@@ -112,7 +115,7 @@ const (
 	RouteConditionCertificateProvisioned apis.ConditionType = "CertificateProvisioned"
 )
 
-// RouteStatusFields holds all of the non-duckv1beta1.Status status fields of a Route.
+// RouteStatusFields holds all of the non-duckv1.Status status fields of a Route.
 // These are defined outline so that we can also inline them into Service, and more easily
 // copy them.
 type RouteStatusFields struct {
@@ -147,7 +150,7 @@ type RouteStatusFields struct {
 
 // RouteStatus communicates the observed state of the Route (from the controller).
 type RouteStatus struct {
-	duckv1beta1.Status `json:",inline"`
+	duckv1.Status `json:",inline"`
 
 	RouteStatusFields `json:",inline"`
 }
@@ -160,4 +163,9 @@ type RouteList struct {
 	metav1.ListMeta `json:"metadata"`
 
 	Items []Route `json:"items"`
+}
+
+// GetStatus retrieves the status of the Route. Implements the KRShaped interface.
+func (r *Route) GetStatus() *duckv1.Status {
+	return &r.Status.Status
 }

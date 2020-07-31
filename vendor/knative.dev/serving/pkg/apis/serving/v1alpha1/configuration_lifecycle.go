@@ -20,10 +20,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"knative.dev/pkg/apis"
-	duckv1beta1 "knative.dev/pkg/apis/duck/v1beta1"
 )
 
 var confCondSet = apis.NewLivingConditionSet()
+
+// GetConditionSet retrieves the ConditionSet of the Configuration. Implements the KRShaped interface.
+func (*Configuration) GetConditionSet() apis.ConditionSet {
+	return confCondSet
+}
 
 func (r *Configuration) GetGroupVersionKind() schema.GroupVersionKind {
 	return SchemeGroupVersion.WithKind("Configuration")
@@ -88,7 +92,9 @@ func (cs *ConfigurationStatus) SetLatestCreatedRevisionName(name string) {
 
 func (cs *ConfigurationStatus) SetLatestReadyRevisionName(name string) {
 	cs.LatestReadyRevisionName = name
-	confCondSet.Manage(cs).MarkTrue(ConfigurationConditionReady)
+	if cs.LatestReadyRevisionName == cs.LatestCreatedRevisionName {
+		confCondSet.Manage(cs).MarkTrue(ConfigurationConditionReady)
+	}
 }
 
 func (cs *ConfigurationStatus) MarkLatestCreatedFailed(name, message string) {
@@ -110,8 +116,4 @@ func (cs *ConfigurationStatus) MarkLatestReadyDeleted() {
 		ConfigurationConditionReady,
 		"RevisionDeleted",
 		"Revision %q was deleted.", cs.LatestReadyRevisionName)
-}
-
-func (cs *ConfigurationStatus) duck() *duckv1beta1.Status {
-	return &cs.Status
 }

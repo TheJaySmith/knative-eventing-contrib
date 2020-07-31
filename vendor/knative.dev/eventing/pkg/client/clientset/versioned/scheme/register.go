@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,18 +24,32 @@ import (
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	serializer "k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	eventingv1alpha1 "knative.dev/eventing/pkg/apis/eventing/v1alpha1"
-	messagingv1alpha1 "knative.dev/eventing/pkg/apis/messaging/v1alpha1"
+	configsv1alpha1 "knative.dev/eventing/pkg/apis/configs/v1alpha1"
+	eventingv1 "knative.dev/eventing/pkg/apis/eventing/v1"
+	eventingv1beta1 "knative.dev/eventing/pkg/apis/eventing/v1beta1"
+	flowsv1 "knative.dev/eventing/pkg/apis/flows/v1"
+	flowsv1beta1 "knative.dev/eventing/pkg/apis/flows/v1beta1"
+	messagingv1 "knative.dev/eventing/pkg/apis/messaging/v1"
+	messagingv1beta1 "knative.dev/eventing/pkg/apis/messaging/v1beta1"
 	sourcesv1alpha1 "knative.dev/eventing/pkg/apis/sources/v1alpha1"
+	sourcesv1alpha2 "knative.dev/eventing/pkg/apis/sources/v1alpha2"
+	sourcesv1beta1 "knative.dev/eventing/pkg/apis/sources/v1beta1"
 )
 
 var Scheme = runtime.NewScheme()
 var Codecs = serializer.NewCodecFactory(Scheme)
 var ParameterCodec = runtime.NewParameterCodec(Scheme)
 var localSchemeBuilder = runtime.SchemeBuilder{
-	eventingv1alpha1.AddToScheme,
-	messagingv1alpha1.AddToScheme,
+	configsv1alpha1.AddToScheme,
+	eventingv1beta1.AddToScheme,
+	eventingv1.AddToScheme,
+	flowsv1beta1.AddToScheme,
+	flowsv1.AddToScheme,
+	messagingv1beta1.AddToScheme,
+	messagingv1.AddToScheme,
 	sourcesv1alpha1.AddToScheme,
+	sourcesv1alpha2.AddToScheme,
+	sourcesv1beta1.AddToScheme,
 }
 
 // AddToScheme adds all types of this clientset into the given scheme. This allows composition

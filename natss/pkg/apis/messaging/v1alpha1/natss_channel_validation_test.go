@@ -21,15 +21,17 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"knative.dev/pkg/webhook"
+	"knative.dev/pkg/webhook/resourcesemantics"
 
 	eventingduck "knative.dev/eventing/pkg/apis/duck/v1alpha1"
 	"knative.dev/pkg/apis"
 )
 
 func TestNatssChannelValidation(t *testing.T) {
+	aURL, _ := apis.ParseURL("http://example.com")
+
 	testCases := map[string]struct {
-		cr   webhook.GenericCRD
+		cr   resourcesemantics.GenericCRD
 		want *apis.FieldError
 	}{
 		"empty spec": {
@@ -43,8 +45,8 @@ func TestNatssChannelValidation(t *testing.T) {
 				Spec: NatssChannelSpec{
 					Subscribable: &eventingduck.Subscribable{
 						Subscribers: []eventingduck.SubscriberSpec{{
-							SubscriberURI: "subscriberendpoint",
-							ReplyURI:      "resultendpoint",
+							SubscriberURI: aURL,
+							ReplyURI:      aURL,
 						}},
 					}},
 			},
@@ -55,8 +57,8 @@ func TestNatssChannelValidation(t *testing.T) {
 				Spec: NatssChannelSpec{
 					Subscribable: &eventingduck.Subscribable{
 						Subscribers: []eventingduck.SubscriberSpec{{
-							SubscriberURI: "subscriberendpoint",
-							ReplyURI:      "replyendpoint",
+							SubscriberURI: aURL,
+							ReplyURI:      aURL,
 						}, {}},
 					}},
 			},

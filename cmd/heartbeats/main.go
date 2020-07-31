@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -25,10 +26,9 @@ import (
 	"strconv"
 	"time"
 
-	"knative.dev/eventing-contrib/pkg/kncloudevents"
+	duckv1 "knative.dev/pkg/apis/duck/v1"
 
-	"github.com/cloudevents/sdk-go/pkg/cloudevents"
-	"github.com/cloudevents/sdk-go/pkg/cloudevents/types"
+	cloudevents "github.com/cloudevents/sdk-go/v2"
 	"github.com/kelseyhightower/envconfig"
 )
 
@@ -55,13 +55,19 @@ func init() {
 
 type envConfig struct {
 	// Sink URL where to send heartbeat cloudevents
-	Sink string `envconfig:"SINK"`
+	Sink string `envconfig:"K_SINK"`
+
+	// CEOverrides are the CloudEvents overrides to be applied to the outbound event.
+	CEOverrides string `envconfig:"K_CE_OVERRIDES"`
 
 	// Name of this pod.
 	Name string `envconfig:"POD_NAME" required:"true"`
 
 	// Namespace this pod exists in.
 	Namespace string `envconfig:"POD_NAMESPACE" required:"true"`
+
+	// Whether to run continuously or exit.
+	OneShot bool `envconfig:"ONE_SHOT" default:"false"`
 }
 
 func main() {
@@ -77,7 +83,23 @@ func main() {
 		sink = env.Sink
 	}
 
-	c, err := kncloudevents.NewDefaultClient(sink)
+	var ceOverrides *duckv1.CloudEventOverrides
+	if len(env.CEOverrides) > 0 {
+		overrides := duckv1.CloudEventOverrides{}
+		err := json.Unmarshal([]byte(env.CEOverrides), &overrides)
+		if err != nil {
+			log.Printf("[ERROR] Unparseable CloudEvents overrides %s: %v", env.CEOverrides, err)
+			os.Exit(1)
+		}
+		ceOverrides = &overrides
+	}
+
+	p, err := cloudevents.NewHTTP(cloudevents.WithTarget(sink))
+	if err != nil {
+		log.Fatalf("failed to create http protocol: %s", err.Error())
+	}
+
+	c, err := cloudevents.NewClient(p, cloudevents.WithUUIDs(), cloudevents.WithTimeNow())
 	if err != nil {
 		log.Fatalf("failed to create client: %s", err.Error())
 	}
@@ -105,22 +127,32 @@ func main() {
 	for {
 		hb.Sequence++
 
-		event := cloudevents.Event{
-			Context: cloudevents.EventContextV02{
-				Type:   eventType,
-				Source: *types.ParseURLRef(eventSource),
-				Extensions: map[string]interface{}{
-					"the":   42,
-					"heart": "yes",
-					"beats": true,
-				},
-			}.AsV02(),
-			Data: hb,
+		event := cloudevents.NewEvent("1.0")
+		event.SetType(eventType)
+		event.SetSource(eventSource)
+		event.SetExtension("the", 42)
+		event.SetExtension("heart", "yes")
+		event.SetExtension("beats", true)
+
+		if ceOverrides != nil && ceOverrides.Extensions != nil {
+			for n, v := range ceOverrides.Extensions {
+				event.SetExtension(n, v)
+			}
 		}
 
-		if _, _, err := c.Send(context.Background(), event); err != nil {
-			log.Printf("failed to send cloudevent: %s", err.Error())
+		if err := event.SetData(cloudevents.ApplicationJSON, hb); err != nil {
+			log.Printf("failed to set cloudevents data: %s", err.Error())
 		}
+
+		log.Printf("sending cloudevent to %s", sink)
+		if res := c.Send(context.Background(), event); !cloudevents.IsACK(res) {
+			log.Printf("failed to send cloudevent: %v", res)
+		}
+
+		if env.OneShot {
+			return
+		}
+
 		// Wait for next tick
 		<-ticker.C
 	}

@@ -23,21 +23,16 @@ import (
 
 	"knative.dev/eventing-contrib/test"
 	eventingTest "knative.dev/eventing/test"
-	"knative.dev/eventing/test/common"
+	testlib "knative.dev/eventing/test/lib"
 )
 
-var setup = common.Setup
-var tearDown = common.TearDown
-var getChannelTypeMeta = common.GetChannelTypeMeta
-var channels eventingTest.Channels
-var channelTestRunner common.ChannelTestRunner
+var channelTestRunner testlib.ComponentsTestRunner
 
 func TestMain(m *testing.M) {
 	eventingTest.InitializeEventingFlags()
-	channels = eventingTest.EventingFlags.Channels
-	channelTestRunner = common.ChannelTestRunner{
-		ChannelFeatureMap: test.ChannelFeatureMap,
-		ChannelsToTest:    eventingTest.EventingFlags.Channels,
+	channelTestRunner = testlib.ComponentsTestRunner{
+		ComponentFeatureMap: test.ChannelFeatureMap,
+		ComponentsToTest:    eventingTest.EventingFlags.Channels,
 	}
 	os.Exit(m.Run())
 }

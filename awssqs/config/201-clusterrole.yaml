@@ -23,7 +23,7 @@ rules:
   - apps
   resources:
   - deployments
-  verbs:
+  verbs: &everything
   - get
   - list
   - watch
@@ -36,17 +36,17 @@ rules:
   - ""
   resources:
   - events
-  verbs:
-  - get
-  - list
-  - watch
-  - create
-  - update
-  - patch
-  - delete
+  - configmaps
+  verbs: *everything
 
 - apiGroups:
-  - sources.eventing.knative.dev
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs: *everything
+
+- apiGroups:
+  - sources.knative.dev
   resources:
   - awssqssources
   verbs:
@@ -56,7 +56,7 @@ rules:
   - update
   - patch
 - apiGroups:
-  - sources.eventing.knative.dev
+  - sources.knative.dev
   resources:
   - awssqssources/status
   - awssqssources/finalizers
@@ -64,31 +64,34 @@ rules:
   - get
   - update
   - patch
+# Secrets & Services read
 - apiGroups:
-# TODO on these and the eventing ones that this should be replaced with
-# an aggregated role for watching Addressables.
-  - serving.knative.dev
+  - ""
   resources:
+  - secrets
   - services
   verbs:
   - get
   - list
   - watch
-- apiGroups:
-# TODO on these and the eventing ones that this should be replaced with
-# an aggregated role for watching Addressables.
-  - eventing.knative.dev
-  resources:
-  - channels
-  verbs:
-  - get
-  - list
-  - watch
-# Secrets read
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - get
-  - list
+
+
+---
+# The role is needed for the aggregated role source-observer in knative-eventing to provide readonly access to "Sources".
+# Ref: https://github.com/knative/eventing/tree/master/config/core/rolessource-observer-clusterrole.yaml.
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: eventing-contrib-awssqs-source-observer
+  labels:
+    eventing.knative.dev/release: devel
+    duck.knative.dev/source: "true"
+rules:
+  - apiGroups:
+      - "sources.knative.dev"
+    resources:
+      - "awssqssources"
+    verbs:
+      - get
+      - list
+      - watch

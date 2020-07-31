@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,8 @@ package v1alpha1
 
 import (
 	appsv1 "k8s.io/api/apps/v1"
-	"knative.dev/eventing/pkg/apis/duck"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"knative.dev/pkg/apis"
 )
 
@@ -32,18 +33,34 @@ const (
 	// ApiServerConditionDeployed has status True when the ApiServerSource has had it's deployment created.
 	ApiServerConditionDeployed apis.ConditionType = "Deployed"
 
-	// ApiServerConditionEventTypeProvided has status True when the ApiServerSource has been configured with its event types.
-	ApiServerConditionEventTypeProvided apis.ConditionType = "EventTypesProvided"
+	// ApiServerConditionSufficientPermissions has status True when the ApiServerSource has sufficient permissions to access resources.
+	ApiServerConditionSufficientPermissions apis.ConditionType = "SufficientPermissions"
 )
 
 var apiserverCondSet = apis.NewLivingConditionSet(
 	ApiServerConditionSinkProvided,
 	ApiServerConditionDeployed,
+	ApiServerConditionSufficientPermissions,
 )
+
+// GetGroupVersionKind returns the GroupVersionKind.
+func (s *ApiServerSource) GetGroupVersionKind() schema.GroupVersionKind {
+	return SchemeGroupVersion.WithKind("ApiServerSource")
+}
+
+// GetUntypedSpec returns the spec of the ApiServerSource.
+func (s *ApiServerSource) GetUntypedSpec() interface{} {
+	return s.Spec
+}
 
 // GetCondition returns the condition currently associated with the given type, or nil.
 func (s *ApiServerSourceStatus) GetCondition(t apis.ConditionType) *apis.Condition {
 	return apiserverCondSet.Manage(s).GetCondition(t)
+}
+
+// GetTopLevelCondition returns the top level condition.
+func (s *ApiServerSourceStatus) GetTopLevelCondition() *apis.Condition {
+	return apiserverCondSet.Manage(s).GetTopLevelCondition()
 }
 
 // InitializeConditions sets relevant unset conditions to Unknown state.
@@ -53,9 +70,35 @@ func (s *ApiServerSourceStatus) InitializeConditions() {
 
 // MarkSink sets the condition that the source has a sink configured.
 func (s *ApiServerSourceStatus) MarkSink(uri string) {
-	s.SinkURI = uri
+	s.SinkURI = nil
 	if len(uri) > 0 {
-		apiserverCondSet.Manage(s).MarkTrue(ApiServerConditionSinkProvided)
+		if u, err := apis.ParseURL(uri); err != nil {
+			apiserverCondSet.Manage(s).MarkFalse(ApiServerConditionSinkProvided, "SinkInvalid", "Failed to parse sink: %v", err)
+		} else {
+			s.SinkURI = u
+			apiserverCondSet.Manage(s).MarkTrue(ApiServerConditionSinkProvided)
+		}
+
+	} else {
+		apiserverCondSet.Manage(s).MarkFalse(ApiServerConditionSinkProvided, "SinkEmpty", "Sink has resolved to empty.")
+	}
+}
+
+// MarkSinkWarnDeprecated sets the condition that the source has a sink configured and warns ref is deprecated.
+func (s *ApiServerSourceStatus) MarkSinkWarnRefDeprecated(uri string) {
+	if u, err := apis.ParseURL(uri); err != nil {
+		s.SinkURI = nil
+	} else {
+		s.SinkURI = u
+	}
+	if len(uri) > 0 {
+		c := apis.Condition{
+			Type:     ApiServerConditionSinkProvided,
+			Status:   corev1.ConditionTrue,
+			Severity: apis.ConditionSeverityError,
+			Message:  "Using deprecated object ref fields when specifying spec.sink. Update to spec.sink.ref. These will be removed in the future.",
+		}
+		apiserverCondSet.Manage(s).SetCondition(c)
 	} else {
 		apiserverCondSet.Manage(s).MarkUnknown(ApiServerConditionSinkProvided, "SinkEmpty", "Sink has resolved to empty.%s", "")
 	}
@@ -69,23 +112,32 @@ func (s *ApiServerSourceStatus) MarkNoSink(reason, messageFormat string, message
 // PropagateDeploymentAvailability uses the availability of the provided Deployment to determine if
 // ApiServerConditionDeployed should be marked as true or false.
 func (s *ApiServerSourceStatus) PropagateDeploymentAvailability(d *appsv1.Deployment) {
-	if duck.DeploymentIsAvailable(&d.Status, false) {
-		apiserverCondSet.Manage(s).MarkTrue(ApiServerConditionDeployed)
-	} else {
-		// I don't know how to propagate the status well, so just give the name of the Deployment
-		// for now.
-		apiserverCondSet.Manage(s).MarkFalse(ApiServerConditionDeployed, "DeploymentUnavailable", "The Deployment '%s' is unavailable.", d.Name)
+	deploymentAvailableFound := false
+	for _, cond := range d.Status.Conditions {
+		if cond.Type == appsv1.DeploymentAvailable {
+			deploymentAvailableFound = true
+			if cond.Status == corev1.ConditionTrue {
+				apiserverCondSet.Manage(s).MarkTrue(ApiServerConditionDeployed)
+			} else if cond.Status == corev1.ConditionFalse {
+				apiserverCondSet.Manage(s).MarkFalse(ApiServerConditionDeployed, cond.Reason, cond.Message)
+			} else if cond.Status == corev1.ConditionUnknown {
+				apiserverCondSet.Manage(s).MarkUnknown(ApiServerConditionDeployed, cond.Reason, cond.Message)
+			}
+		}
+	}
+	if !deploymentAvailableFound {
+		apiserverCondSet.Manage(s).MarkUnknown(ApiServerConditionDeployed, "DeploymentUnavailable", "The Deployment '%s' is unavailable.", d.Name)
 	}
 }
 
-// MarkEventTypes sets the condition that the source has set its event type.
-func (s *ApiServerSourceStatus) MarkEventTypes() {
-	apiserverCondSet.Manage(s).MarkTrue(ApiServerConditionEventTypeProvided)
+// MarkSufficientPermissions sets the condition that the source has enough permissions to access the resources.
+func (s *ApiServerSourceStatus) MarkSufficientPermissions() {
+	apiserverCondSet.Manage(s).MarkTrue(ApiServerConditionSufficientPermissions)
 }
 
-// MarkNoEventTypes sets the condition that the source does not its event type configured.
-func (s *ApiServerSourceStatus) MarkNoEventTypes(reason, messageFormat string, messageA ...interface{}) {
-	apiserverCondSet.Manage(s).MarkFalse(ApiServerConditionEventTypeProvided, reason, messageFormat, messageA...)
+// MarkNoSufficientPermissions sets the condition that the source does not have enough permissions to access the resources
+func (s *ApiServerSourceStatus) MarkNoSufficientPermissions(reason, messageFormat string, messageA ...interface{}) {
+	apiserverCondSet.Manage(s).MarkFalse(ApiServerConditionSufficientPermissions, reason, messageFormat, messageA...)
 }
 
 // IsReady returns true if the resource is ready overall.

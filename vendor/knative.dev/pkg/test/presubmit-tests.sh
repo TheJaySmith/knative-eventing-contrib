@@ -22,10 +22,31 @@
 # in a net-negative contributor experience.
 export DISABLE_MD_LINTING=1
 
+export GO111MODULE=on
+
 source $(dirname $0)/../vendor/knative.dev/test-infra/scripts/presubmit-tests.sh
 
 # TODO(#17): Write integration tests.
 
 # We use the default build, unit and integration test runners.
+
+function pre_build_tests() {
+  # Test the custom code generators. This makes sure we can compile the output
+  # of the injection generators.
+  $(dirname $0)/test-reconciler-codegen.sh
+  return 0
+}
+
+# Run the unit tests with an additional flag '-mod=vendor' to avoid
+# downloading the deps in unit tests CI job
+function unit_tests() {
+  # Run the default way.
+  default_unit_test_runner || failed=1
+
+  # Run unit testing select packages without race detection,
+  # so that they may use: // +build !race
+  report_go_test ./leaderelection || failed=1
+
+}
 
 main $@

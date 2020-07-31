@@ -25,14 +25,10 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sqs"
-	"github.com/cloudevents/sdk-go/pkg/cloudevents"
-	"github.com/cloudevents/sdk-go/pkg/cloudevents/client"
-	"github.com/cloudevents/sdk-go/pkg/cloudevents/types"
-
+	cloudevents "github.com/cloudevents/sdk-go/v2"
 	"go.uber.org/zap"
 	"golang.org/x/net/context"
 	sourcesv1alpha1 "knative.dev/eventing-contrib/awssqs/pkg/apis/sources/v1alpha1"
-	"knative.dev/eventing-contrib/pkg/kncloudevents"
 	"knative.dev/pkg/logging"
 )
 
@@ -54,7 +50,7 @@ type Adapter struct {
 	OnFailedPollWaitSecs time.Duration
 
 	// Client sends cloudevents to the target.
-	client client.Client
+	client cloudevents.Client
 }
 
 // getRegion takes an AWS SQS URL and extracts the region from it
@@ -80,7 +76,7 @@ func getRegion(url string) (string, error) {
 func (a *Adapter) initClient() error {
 	if a.client == nil {
 		var err error
-		if a.client, err = kncloudevents.NewDefaultClient(a.SinkURI); err != nil {
+		if a.client, err = cloudevents.NewDefaultClient(); err != nil {
 			return err
 		}
 	}
@@ -104,11 +100,19 @@ func (a *Adapter) Start(ctx context.Context, stopCh <-chan struct{}) error {
 		return err
 	}
 
-	sess := session.Must(session.NewSessionWithOptions(session.Options{
-		SharedConfigState: session.SharedConfigDisable,
-		Config:            aws.Config{Region: &region},
-		SharedConfigFiles: []string{a.CredsFile},
-	}))
+	var sess *session.Session
+
+	if a.CredsFile == "" {
+		sess = session.Must(session.NewSessionWithOptions(session.Options{
+			Config: aws.Config{Region: &region},
+		}))
+	} else {
+		sess = session.Must(session.NewSessionWithOptions(session.Options{
+			SharedConfigState: session.SharedConfigDisable,
+			Config:            aws.Config{Region: &region},
+			SharedConfigFiles: []string{a.CredsFile},
+		}))
+	}
 
 	q := sqs.New(sess)
 
@@ -159,6 +163,8 @@ func (a *Adapter) receiveMessage(ctx context.Context, m *sqs.Message, ack func()
 	logger := logging.FromContext(ctx).With(zap.Any("eventID", m.MessageId)).With(zap.Any("sink", a.SinkURI))
 	logger.Debugw("Received message from SQS:", zap.Any("message", m))
 
+	ctx = cloudevents.ContextWithTarget(ctx, a.SinkURI)
+
 	err := a.postMessage(ctx, logger, m)
 	if err != nil {
 		logger.Infof("Event delivery failed: %s", err)
@@ -168,28 +174,40 @@ func (a *Adapter) receiveMessage(ctx context.Context, m *sqs.Message, ack func()
 	}
 }
 
-// postMessage sends an SQS event to the SinkURI
-func (a *Adapter) postMessage(ctx context.Context, logger *zap.SugaredLogger, m *sqs.Message) error {
-
-	// TODO verify the timestamp conversion
+func (a *Adapter) makeEvent(m *sqs.Message) (*cloudevents.Event, error) {
 	timestamp, err := strconv.ParseInt(*m.Attributes["SentTimestamp"], 10, 64)
-	if err != nil {
-		logger.Errorw("Failed to unmarshal the message.", zap.Error(err), zap.Any("message", m.Body))
+	if err == nil {
+		//Convert to nanoseconds as sqs SentTimestamp is millisecond
+		timestamp = timestamp * int64(1000000)
+	} else {
 		timestamp = time.Now().UnixNano()
 	}
 
-	event := cloudevents.Event{
-		Context: cloudevents.EventContextV02{
-			ID:     *m.MessageId,
-			Type:   sourcesv1alpha1.AwsSqsSourceEventType,
-			Source: *types.ParseURLRef(a.QueueURL),
-			Time:   &types.Timestamp{Time: time.Unix(timestamp, 0)},
-		}.AsV02(),
-		Data: m,
-	}
+	event := cloudevents.NewEvent(cloudevents.VersionV1)
+	event.SetID(*m.MessageId)
+	event.SetType(sourcesv1alpha1.AwsSqsSourceEventType)
+	event.SetSource(cloudevents.ParseURIRef(a.QueueURL).String())
+	event.SetTime(time.Unix(0, timestamp))
 
-	_, _, err = a.client.Send(context.TODO(), event)
-	return err
+	if err := event.SetData(cloudevents.ApplicationJSON, m); err != nil {
+		return nil, err
+	}
+	return &event, nil
+}
+
+// postMessage sends an SQS event to the SinkURI
+func (a *Adapter) postMessage(ctx context.Context, logger *zap.SugaredLogger, m *sqs.Message) error {
+	event, err := a.makeEvent(m)
+
+	if err != nil {
+		logger.Error("Cloud Event creation error", zap.Error(err))
+		return err
+	}
+	if result := a.client.Send(ctx, *event); !cloudevents.IsACK(result) {
+		logger.Error("Cloud Event delivery error", zap.Error(result))
+		return result
+	}
+	return nil
 }
 
 // poll reads messages from the queue in batches of a given maximum size.

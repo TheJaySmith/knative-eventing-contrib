@@ -21,12 +21,14 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"knative.dev/pkg/apis"
+	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"knative.dev/pkg/kmeta"
 )
 
 // Metric represents a resource to configure the metric collector with.
 //
 // +genclient
+// +genreconciler
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type Metric struct {
 	metav1.TypeMeta `json:",inline"`
@@ -50,6 +52,9 @@ var (
 
 	// Check that we can create OwnerReferences to a Metric.
 	_ kmeta.OwnerRefable = (*Metric)(nil)
+
+	// Check that the type conforms to the duck Knative Resource shape.
+	_ duckv1.KRShaped = (*Metric)(nil)
 )
 
 // MetricSpec contains all values a metric collector needs to operate.
@@ -63,7 +68,9 @@ type MetricSpec struct {
 }
 
 // MetricStatus reflects the status of metric collection for this specific entity.
-type MetricStatus struct{}
+type MetricStatus struct {
+	duckv1.Status `json:",inline"`
+}
 
 // MetricList is a list of Metric resources
 //
@@ -73,4 +80,9 @@ type MetricList struct {
 	metav1.ListMeta `json:"metadata"`
 
 	Items []Metric `json:"items"`
+}
+
+// GetStatus retrieves the status of the Metric. Implements the KRShaped interface.
+func (t *Metric) GetStatus() *duckv1.Status {
+	return &t.Status.Status
 }

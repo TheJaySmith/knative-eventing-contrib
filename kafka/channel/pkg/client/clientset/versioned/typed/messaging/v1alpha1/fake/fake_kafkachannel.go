@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -131,7 +131,7 @@ func (c *FakeKafkaChannels) DeleteCollection(options *v1.DeleteOptions, listOpti
 // Patch applies the patch and returns the patched kafkaChannel.
 func (c *FakeKafkaChannels) Patch(name string, pt types.PatchType, data []byte, subresources ...string) (result *v1alpha1.KafkaChannel, err error) {
 	obj, err := c.Fake.
-		Invokes(testing.NewPatchSubresourceAction(kafkachannelsResource, c.ns, name, data, subresources...), &v1alpha1.KafkaChannel{})
+		Invokes(testing.NewPatchSubresourceAction(kafkachannelsResource, c.ns, name, pt, data, subresources...), &v1alpha1.KafkaChannel{})
 
 	if obj == nil {
 		return nil, err

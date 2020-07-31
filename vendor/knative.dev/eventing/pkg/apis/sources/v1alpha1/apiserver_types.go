@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,9 +17,10 @@ limitations under the License.
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	"knative.dev/eventing/pkg/apis/sources/v1alpha2"
+	"knative.dev/pkg/apis"
+	duckv1 "knative.dev/pkg/apis/duck/v1"
 	duckv1beta1 "knative.dev/pkg/apis/duck/v1beta1"
 	"knative.dev/pkg/kmeta"
 )
@@ -28,7 +29,6 @@ import (
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // ApiServerSource is the Schema for the apiserversources API
-// +k8s:openapi-gen=true
 type ApiServerSource struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -37,8 +37,23 @@ type ApiServerSource struct {
 	Status ApiServerSourceStatus `json:"status,omitempty"`
 }
 
-// Check that we can create OwnerReferences to a Configuration.
-var _ kmeta.OwnerRefable = (*ApiServerSource)(nil)
+var (
+	// Check that we can create OwnerReferences to an ApiServerSource.
+	_ kmeta.OwnerRefable = (*ApiServerSource)(nil)
+
+	// Check that ApiServerSource can return its spec untyped.
+	_ apis.HasSpec = (*ApiServerSource)(nil)
+)
+
+// ApiServerSourceEventTypes is the list of CloudEvent types the ApiServerSource emits.
+var ApiServerSourceEventTypes = []string{
+	ApiServerSourceAddEventType,
+	ApiServerSourceDeleteEventType,
+	ApiServerSourceUpdateEventType,
+	ApiServerSourceAddRefEventType,
+	ApiServerSourceDeleteRefEventType,
+	ApiServerSourceUpdateRefEventType,
+}
 
 const (
 	// ApiServerSourceAddEventType is the ApiServerSource CloudEvent type for adds.
@@ -56,20 +71,6 @@ const (
 	ApiServerSourceDeleteRefEventType = "dev.knative.apiserver.ref.delete"
 )
 
-// GetGroupVersionKind returns the GroupVersionKind.
-func (s *ApiServerSource) GetGroupVersionKind() schema.GroupVersionKind {
-	return SchemeGroupVersion.WithKind("ApiServerSource")
-}
-
-// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-
-// ApiServerSourceList contains a list of ApiServerSource
-type ApiServerSourceList struct {
-	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []ApiServerSource `json:"items"`
-}
-
 // ApiServerSourceSpec defines the desired state of ApiServerSource
 type ApiServerSourceSpec struct {
 	// Resources is the list of resources to watch
@@ -82,7 +83,18 @@ type ApiServerSourceSpec struct {
 
 	// Sink is a reference to an object that will resolve to a domain name to use as the sink.
 	// +optional
-	Sink *corev1.ObjectReference `json:"sink,omitempty"`
+	Sink *duckv1beta1.Destination `json:"sink,omitempty"`
+
+	// CloudEventOverrides defines overrides to control the output format and
+	// modifications of the event sent to the sink.
+	// +optional
+	CloudEventOverrides *duckv1.CloudEventOverrides `json:"ceOverrides,omitempty"`
+
+	// ResourceOwner is an additional filter to only track resources that are
+	// owned by a specific resource type. If ResourceOwner matches Resources[n]
+	// then Resources[n] is allowed to pass the ResourceOwner filter.
+	// +optional
+	ResourceOwner *v1alpha2.APIVersionKind `json:"owner,omitempty"`
 
 	// Mode is the mode the receive adapter controller runs under: Ref or Resource.
 	// `Ref` sends only the reference to the resource.
@@ -92,14 +104,14 @@ type ApiServerSourceSpec struct {
 
 // ApiServerSourceStatus defines the observed state of ApiServerSource
 type ApiServerSourceStatus struct {
-	// inherits duck/v1beta1 Status, which currently provides:
-	// * ObservedGeneration - the 'Generation' of the Service that was last processed by the controller.
-	// * Conditions - the latest available observations of a resource's current state.
-	duckv1beta1.Status `json:",inline"`
-
-	// SinkURI is the current active sink URI that has been configured for the ApiServerSource.
-	// +optional
-	SinkURI string `json:"sinkUri,omitempty"`
+	// inherits duck/v1 SourceStatus, which currently provides:
+	// * ObservedGeneration - the 'Generation' of the Service that was last
+	//   processed by the controller.
+	// * Conditions - the latest available observations of a resource's current
+	//   state.
+	// * SinkURI - the current active sink URI that has been configured for the
+	//   Source.
+	duckv1.SourceStatus `json:",inline"`
 }
 
 // ApiServerResource defines the resource to watch
@@ -113,14 +125,25 @@ type ApiServerResource struct {
 
 	// LabelSelector restricts this source to objects with the selected labels
 	// More info: http://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors
-	// +optional
-	LabelSelector *metav1.LabelSelector `json:"labelSelector"`
+	LabelSelector metav1.LabelSelector `json:"labelSelector"`
 
 	// ControllerSelector restricts this source to objects with a controlling owner reference of the specified kind.
 	// Only apiVersion and kind are used. Both are optional.
-	// +optional
-	ControllerSelector *metav1.OwnerReference `json:"controllerSelector"`
+	// Deprecated: Per-resource owner refs will no longer be supported in
+	// v1alpha2, please use Spec.Owner as a GKV.
+	ControllerSelector metav1.OwnerReference `json:"controllerSelector"`
 
 	// If true, send an event referencing the object controlling the resource
+	// Deprecated: Per-resource controller flag will no longer be supported in
+	// v1alpha2, please use Spec.Owner as a GKV.
 	Controller bool `json:"controller"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// ApiServerSourceList contains a list of ApiServerSource
+type ApiServerSourceList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []ApiServerSource `json:"items"`
 }

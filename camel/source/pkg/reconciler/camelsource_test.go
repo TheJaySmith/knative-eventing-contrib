@@ -17,45 +17,52 @@ limitations under the License.
 package reconciler
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
-	camelv1alpha1 "github.com/apache/camel-k/pkg/apis/camel/v1alpha1"
+	clientgotesting "k8s.io/client-go/testing"
+	fakesourceclient "knative.dev/eventing-contrib/camel/source/pkg/client/injection/client/fake"
+	"knative.dev/eventing-contrib/camel/source/pkg/client/injection/reconciler/sources/v1alpha1/camelsource"
+	reconcilertesting "knative.dev/eventing-contrib/camel/source/pkg/reconciler/testing"
+	"knative.dev/pkg/client/injection/ducks/duck/v1/addressable"
+	"knative.dev/pkg/configmap"
+	"knative.dev/pkg/controller"
+	"knative.dev/pkg/logging"
+	logtesting "knative.dev/pkg/logging/testing"
+
+	camelv1 "github.com/apache/camel-k/pkg/apis/camel/v1"
 	"go.uber.org/zap"
 	v1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/record"
 	sourcesv1alpha1 "knative.dev/eventing-contrib/camel/source/pkg/apis/sources/v1alpha1"
+	fakecamelclient "knative.dev/eventing-contrib/camel/source/pkg/camel-k/injection/client/fake"
 	"knative.dev/eventing-contrib/camel/source/pkg/reconciler/resources"
-	controllertesting "knative.dev/eventing-contrib/pkg/controller/testing"
+	duckv1 "knative.dev/pkg/apis/duck/v1"
 	duckv1alpha1 "knative.dev/pkg/apis/duck/v1alpha1"
-)
+	duckv1beta1 "knative.dev/pkg/apis/duck/v1beta1"
+	"knative.dev/pkg/resolver"
 
-var (
-	// deletionTime is used when objects are marked as deleted. Rfc3339Copy()
-	// truncates to seconds to match the loss of precision during serialization.
-	deletionTime = metav1.Now().Rfc3339Copy()
-
-	trueVal = true
+	. "knative.dev/eventing-contrib/camel/source/pkg/reconciler/testing"
+	. "knative.dev/pkg/reconciler/testing"
 )
 
 const (
-	alternativeImage       = "apache/camel-k-base-alternative"
-	alternativeContextName = "alternative-context"
+	alternativeImage   = "apache/camel-k-base-alternative"
+	alternativeKitName = "alternative-kit"
 
 	sourceName = "test-camel-source"
-	sourceUID  = "1234-5678-90"
 	testNS     = "testnamespace"
 	generation = 1
 
 	addressableName       = "testsink"
-	addressableKind       = "Sink"
-	addressableAPIVersion = "duck.knative.dev/v1alpha1"
-	addressableDNS        = "addressable.sink.svc.cluster.local"
+	addressableKind       = "Addressable"
+	addressableAPIVersion = "duck.knative.dev/v1"
 	addressableURI        = "http://addressable.sink.svc.cluster.local"
 )
 
@@ -66,7 +73,9 @@ func init() {
 		corev1.AddToScheme,
 		sourcesv1alpha1.SchemeBuilder.AddToScheme,
 		duckv1alpha1.AddToScheme,
-		camelv1alpha1.SchemeBuilder.AddToScheme,
+		duckv1beta1.AddToScheme,
+		camelv1.SchemeBuilder.AddToScheme,
+		duckv1.SchemeBuilder.AddToScheme,
 	)
 }
 
@@ -79,268 +88,245 @@ func addToScheme(funcs ...func(*runtime.Scheme) error) {
 }
 
 func TestReconcile(t *testing.T) {
-	testCases := []controllertesting.TestCase{
-		{
-			Name: "Deleted source",
-			InitialState: []runtime.Object{
-				getDeletedSource(),
-			},
-			WantPresent: []runtime.Object{
-				getDeletedSource(),
-			},
-			WantAbsent: []runtime.Object{
-				getContext(),
-			},
-		},
-		{
-			Name: "Cannot get sink URI",
-			InitialState: []runtime.Object{
-				getSource(),
-			},
-			WantPresent: []runtime.Object{
-				func() runtime.Object {
-					s := getSourceWithNoSink()
-					s.Status.ObservedGeneration = generation
-					return s
-				}(),
-			},
-			WantAbsent: []runtime.Object{
-				getContext(),
-			},
-			WantErrMsg: "sinks.duck.knative.dev \"testsink\" not found",
-		},
-		{
-			Name: "Creating integration",
-			InitialState: []runtime.Object{
-				getSource(),
-				getAddressable(),
-			},
-			WantPresent: []runtime.Object{
-				func() runtime.Object {
-					s := getDeployingSource()
-					s.Status.ObservedGeneration = generation
-					return s
-				}(),
-			},
-			WantAbsent: []runtime.Object{
-				getContext(),
-			},
-		},
-		{
-			Name: "Source Deployed",
-			InitialState: []runtime.Object{
-				getSource(),
-				getAddressable(),
-				getRunningIntegration(t),
-			},
-			WantPresent: []runtime.Object{
-				func() runtime.Object {
-					s := asDeployedSource(getSource())
-					s.Status.ObservedGeneration = generation
-					return s
-				}(),
-				getRunningIntegration(t),
-			},
-			WantAbsent: []runtime.Object{
-				getContext(),
-			},
-		},
-		{
-			Name:       "Camel K Source Deployed",
-			Reconciles: getCamelKSource(),
-			InitialState: []runtime.Object{
-				getCamelKSource(),
-				getAddressable(),
-				getRunningCamelKIntegration(t),
-			},
-			WantPresent: []runtime.Object{
-				func() runtime.Object {
-					s := asDeployedSource(getCamelKSource())
-					s.Status.ObservedGeneration = generation
-					return s
-				}(),
-				getRunningCamelKIntegration(t),
-			},
-			WantAbsent: []runtime.Object{
-				getContext(),
-			},
-		},
-		{
-			Name: "Source changed",
-			InitialState: []runtime.Object{
-				getSource(),
-				getAddressable(),
-				getWrongIntegration(t),
-			},
-			WantPresent: []runtime.Object{
-				func() runtime.Object {
-					s := withUpdatingIntegration(getSource())
-					s.Status.ObservedGeneration = generation
-					return s
-				}(),
-				getRunningIntegration(t),
-			},
-			WantAbsent: []runtime.Object{
-				getContext(),
-			},
-		},
-		{
-			Name:       "Camel K Source changed",
-			Reconciles: getCamelKSource(),
-			InitialState: []runtime.Object{
-				getCamelKSource(),
-				getAddressable(),
-				getWrongIntegration(t),
-			},
-			WantPresent: []runtime.Object{
-				func() runtime.Object {
-					s := withUpdatingIntegration(getCamelKSource())
-					s.Status.ObservedGeneration = generation
-					return s
-				}(),
-				getRunningCamelKIntegration(t),
-			},
-			WantAbsent: []runtime.Object{
-				getContext(),
-			},
-		},
-		{
-			Name: "Source with context",
-			InitialState: []runtime.Object{
-				withAlternativeContext(getSource()),
-				getAddressable(),
-				integrationWithAlternativeContext(getRunningIntegration(t)),
-				getAlternativeContext(),
-			},
-			WantPresent: []runtime.Object{
-				func() runtime.Object {
-					s := withAlternativeContext(asDeployedSource(getSource()))
-					s.Status.ObservedGeneration = generation
-					return s
-				}(),
-				integrationWithAlternativeContext(getRunningIntegration(t)),
-				getAlternativeContext(),
-			},
-		},
-		{
-			Name:       "Camel K Source with context",
-			Reconciles: withAlternativeContext(getCamelKSource()),
-			InitialState: []runtime.Object{
-				withAlternativeContext(getCamelKSource()),
-				getAddressable(),
-				integrationWithAlternativeContext(getRunningCamelKIntegration(t)),
-				getAlternativeContext(),
-			},
-			WantPresent: []runtime.Object{
-				func() runtime.Object {
-					s := withAlternativeContext(asDeployedSource(getCamelKSource()))
-					s.Status.ObservedGeneration = generation
-					return s
-				}(),
-				integrationWithAlternativeContext(getRunningCamelKIntegration(t)),
-				getAlternativeContext(),
-			},
-		},
-		{
-			Name:       "Camel K Flow source",
-			Reconciles: getCamelKFlowSource(),
-			InitialState: []runtime.Object{
-				getCamelKFlowSource(),
-				getAddressable(),
-				getRunningCamelKFlowIntegration(t),
-			},
-			WantPresent: []runtime.Object{
-				func() runtime.Object {
-					s := asDeployedSource(getCamelKFlowSource())
-					s.Status.ObservedGeneration = generation
-					return s
-				}(),
-				getRunningCamelKFlowIntegration(t),
-			},
-		},
+	key := testNS + "/" + sourceName
+	sink := &corev1.ObjectReference{
+		Kind:       addressableKind,
+		Namespace:  testNS,
+		Name:       addressableName,
+		APIVersion: addressableAPIVersion,
 	}
-	for _, tc := range testCases {
-		recorder := record.NewBroadcaster().NewRecorder(scheme.Scheme, corev1.EventSource{Component: controllerAgentName})
-		tc.IgnoreTimes = true
-		tc.ReconcileKey = fmt.Sprintf("%s/%s", testNS, sourceName)
-		tc.Scheme = scheme.Scheme
-		if tc.Reconciles == nil {
-			tc.Reconciles = getSource()
-		}
 
-		c := tc.GetClient()
-		r := &reconciler{
-			client:   c,
-			scheme:   tc.Scheme,
-			recorder: recorder,
-		}
-		if err := r.InjectClient(c); err != nil {
-			t.Errorf("cannot inject client: %v", zap.Error(err))
-		}
+	table := TableTest{{
+		Name: "bad workqueue key",
+		// Make sure Reconcile handles bad keys.
+		Key: "too/many/parts",
+	}, {
+		Name: "key not found",
+		// Make sure Reconcile handles good keys that don't exist.
+		Key: "not-found",
+	}, {
+		Name: "Deleted source",
+		Key:  key,
+		Objects: []runtime.Object{
+			NewCamelSource(sourceName, testNS, generation,
+				WithCamelSourceDeleted),
+		},
+	}, {
+		Name: "Cannot get sink URI",
+		Key:  key,
+		Objects: []runtime.Object{
+			getBaseSource(),
+		},
+		WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
+			Object: getBaseSource(
+				// Updates
+				WithInitCamelSource,
+				WithCamelSourceSinkNotFound()),
+		}},
+		WantErr: true,
+		WantEvents: []string{
+			Eventf(corev1.EventTypeWarning, "InternalError", `failed to get ref %s: addressables.duck.knative.dev "testsink" not found`, sink),
+		},
+	}, {
+		Name: "Creating integration",
+		Key:  key,
+		Objects: []runtime.Object{
+			getBaseSource(),
+			getAddressable(),
+		},
+		WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
+			Object: getBaseSource(
+				// Updates
+				WithInitCamelSource,
+				WithCamelSourceSink(addressableURI),
+				WithCamelSourceDeploying()),
+		}},
+		WantCreates: []runtime.Object{
+			NewIntegration("test-camel-source", testNS, getBaseSource(WithCamelSourceSink(addressableURI))),
+		},
+		WantEvents: []string{
+			Eventf(corev1.EventTypeNormal, "Deployed", `Created integration "test-camel-source-*"`),
+		},
+	}, {
+		Name: "Source Deployed",
+		Key:  key,
+		Objects: []runtime.Object{
+			getBaseSource(
+				WithInitCamelSource,
+				WithCamelSourceSink(addressableURI),
+				WithCamelSourceDeploying()),
+			getAddressable(),
+			getRunningIntegration(),
+		},
+		WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
+			Object: getBaseSource(
+				WithInitCamelSource,
+				WithCamelSourceSink(addressableURI),
+				WithCamelSourceDeploying(),
+				// Updates
+				WithCamelSourceDeployed(),
+			),
+		}},
+		WantEvents: []string{
+			Eventf(corev1.EventTypeNormal, "CamelSourceReconciled", `CamelSource reconciled: "testnamespace/test-camel-source"`),
+		},
+	}, {
+		Name: "Camel K Source Deployed",
+		Key:  key,
+		Objects: []runtime.Object{
+			getCamelKSource(),
+			getAddressable(),
+			getRunningCamelKIntegration(t),
+		},
+		WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
+			Object: getCamelKSource(
+				// Updates
+				WithCamelSourceDeployed(),
+			),
+		}},
+		WantEvents: []string{
+			Eventf(corev1.EventTypeNormal, "CamelSourceReconciled", `CamelSource reconciled: "testnamespace/test-camel-source"`),
+		},
+	}, {
+		Name: "Source changed",
+		Key:  key,
+		Objects: []runtime.Object{
+			getBaseSource(),
+			getAddressable(),
+			getWrongIntegration(),
+		},
+		WantUpdates: []clientgotesting.UpdateActionImpl{{
+			Object: getRunningIntegration(),
+		}},
+		WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
+			Object: getBaseSource(
+				// Updates
+				WithInitCamelSource,
+				WithCamelSourceSink(addressableURI),
+				WithCamelSourceIntegrationUpdated()),
+		}},
+		WantEvents: []string{
+			Eventf(corev1.EventTypeNormal, "IntegrationUpdated", `Updated integration "test-camel-source-*"`),
+		},
+	}, {
+		Name: "Camel K Source changed",
+		Key:  key,
+		Objects: []runtime.Object{
+			getCamelKSource(),
+			getAddressable(),
+			getWrongIntegration(),
+		},
+		WantUpdates: []clientgotesting.UpdateActionImpl{{
+			Object: getRunningCamelKIntegration(t),
+		}},
+		WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
+			Object: getCamelKSource(WithCamelSourceIntegrationUpdated()),
+		}},
+		WantEvents: []string{
+			Eventf(corev1.EventTypeNormal, "IntegrationUpdated", `Updated integration "test-camel-source-*"`),
+		},
+	}, {
+		Name: "Source with context", Key: key,
+		Objects: []runtime.Object{
+			withAlternativeContext(getBaseSource(
+				WithInitCamelSource,
+				WithCamelSourceSink(addressableURI))),
+			getAddressable(),
+			integrationWithAlternativeContext(getRunningIntegration()),
+			getAlternativeContext(),
+		},
+		WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
+			Object: withAlternativeContext(getBaseSource(
+				WithInitCamelSource,
+				WithCamelSourceSink(addressableURI),
+				// Updates
+				WithCamelSourceDeployed(),
+			)),
+		}},
+		WantEvents: []string{
+			Eventf(corev1.EventTypeNormal, "CamelSourceReconciled", `CamelSource reconciled: "testnamespace/test-camel-source"`),
+		},
+	}, {
+		Name: "Camel K Source with context",
+		Key:  key,
+		Objects: []runtime.Object{
+			withAlternativeContext(getCamelKSource()),
+			getAddressable(),
+			integrationWithAlternativeContext(getRunningCamelKIntegration(t)),
+			getAlternativeContext(),
+		},
+		WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
+			Object: withAlternativeContext(getCamelKSource(
+				// Updates
+				WithCamelSourceDeployed(),
+			)),
+		}},
+		WantEvents: []string{
+			Eventf(corev1.EventTypeNormal, "CamelSourceReconciled", `CamelSource reconciled: "testnamespace/test-camel-source"`),
+		},
+	}, {
+		Name: "Camel K Flow source",
+		Key:  key,
+		Objects: []runtime.Object{
+			getCamelKFlowSource(),
+			getAddressable(),
+			getRunningCamelKFlowIntegration(t),
+		},
+		WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
+			Object: getCamelKFlowSource(
+				// Updates
+				WithCamelSourceDeployed(),
+			),
+		}},
+		WantEvents: []string{
+			Eventf(corev1.EventTypeNormal, "CamelSourceReconciled", `CamelSource reconciled: "testnamespace/test-camel-source"`),
+		},
+	}}
 
-		t.Run(tc.Name, tc.Runner(t, r, c))
-	}
+	defer logtesting.ClearAll()
+
+	table.Test(t, reconcilertesting.MakeFactory(func(ctx context.Context, listers *Listers, cmw configmap.Watcher) controller.Reconciler {
+		ctx = addressable.WithDuck(ctx)
+		r := &Reconciler{
+			camelClientSet: fakecamelclient.Get(ctx),
+			sinkResolver:   resolver.NewURIResolver(ctx, func(types.NamespacedName) {}),
+		}
+		return camelsource.NewReconciler(ctx, logging.FromContext(ctx),
+			fakesourceclient.Get(ctx), listers.GetCamelSourcesLister(),
+			controller.GetEventRecorder(ctx), r)
+	}, zap.L()))
 }
 
-func getSource() *sourcesv1alpha1.CamelSource {
-	obj := &sourcesv1alpha1.CamelSource{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: sourcesv1alpha1.SchemeGroupVersion.String(),
-			Kind:       "CamelSource",
-		},
-		ObjectMeta: om(testNS, sourceName, generation),
-		Spec: sourcesv1alpha1.CamelSourceSpec{
+func getCamelKSource(opts ...CamelSourceOption) *sourcesv1alpha1.CamelSource {
+	opts = append([]CamelSourceOption{
+		WithInitCamelSource,
+		WithCamelSourceSpec(sourcesv1alpha1.CamelSourceSpec{
 			Source: sourcesv1alpha1.CamelSourceOriginSpec{
-				DeprecatedComponent: &sourcesv1alpha1.CamelSourceOriginComponentSpec{
-					URI: "timer:tick?period=3s",
-				},
-			},
-			Sink: &corev1.ObjectReference{
-				Name:       addressableName,
-				Kind:       addressableKind,
-				APIVersion: addressableAPIVersion,
-			},
-		},
-	}
-	// selflink is not filled in when we create the object, so clear it
-	obj.ObjectMeta.SelfLink = ""
-	return obj
-}
-
-func getCamelKSource() *sourcesv1alpha1.CamelSource {
-	obj := &sourcesv1alpha1.CamelSource{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: sourcesv1alpha1.SchemeGroupVersion.String(),
-			Kind:       "CamelSource",
-		},
-		ObjectMeta: om(testNS, sourceName, generation),
-		Spec: sourcesv1alpha1.CamelSourceSpec{
-			Source: sourcesv1alpha1.CamelSourceOriginSpec{
-				Integration: &camelv1alpha1.IntegrationSpec{
-					Sources: []camelv1alpha1.SourceSpec{
-						{
-							DataSpec: camelv1alpha1.DataSpec{
-								Name:    "integration.groovy",
-								Content: "from('timer:tick?period=3s').to('knative://endpoint/sink')",
-							},
+				Integration: &camelv1.IntegrationSpec{
+					Sources: []camelv1.SourceSpec{{
+						DataSpec: camelv1.DataSpec{
+							Name:    "integration.groovy",
+							Content: "from('timer:tick?period=3s').to('knative://endpoint/sink')",
 						},
-					},
+					}},
 				},
 			},
-			Sink: &corev1.ObjectReference{
-				Name:       addressableName,
-				Kind:       addressableKind,
-				APIVersion: addressableAPIVersion,
+			Sink: &duckv1beta1.Destination{
+				Ref: &corev1.ObjectReference{
+					Name:       addressableName,
+					Kind:       addressableKind,
+					APIVersion: addressableAPIVersion,
+				},
 			},
-		},
-	}
-	// selflink is not filled in when we create the object, so clear it
-	obj.ObjectMeta.SelfLink = ""
-	return obj
+		}),
+		WithCamelSourceSink(addressableURI),
+		WithCamelSourceDeploying()}, opts...)
+
+	return getBaseSource(opts...)
 }
 
-func getCamelKFlowSource() *sourcesv1alpha1.CamelSource {
-	flow := map[interface{}]interface{}{
+func getCamelKFlowSource(opts ...CamelSourceOption) *sourcesv1alpha1.CamelSource {
+	flow := sourcesv1alpha1.Flow{
 		"from": map[string]interface{}{
 			"uri": "timer:tick?period=3s",
 			"steps": []interface{}{
@@ -352,199 +338,134 @@ func getCamelKFlowSource() *sourcesv1alpha1.CamelSource {
 			},
 		},
 	}
-	source, err := resources.MarshalCamelFlow(flow)
-	if err != nil {
-		panic(err)
-	}
-	obj := &sourcesv1alpha1.CamelSource{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: sourcesv1alpha1.SchemeGroupVersion.String(),
-			Kind:       "CamelSource",
-		},
-		ObjectMeta: om(testNS, sourceName, generation),
-		Spec: sourcesv1alpha1.CamelSourceSpec{
+
+	opts = append([]CamelSourceOption{
+		WithInitCamelSource,
+		WithCamelSourceSpec(sourcesv1alpha1.CamelSourceSpec{
 			Source: sourcesv1alpha1.CamelSourceOriginSpec{
-				Flow: &source,
+				Flow: &flow,
 			},
-			Sink: &corev1.ObjectReference{
-				Name:       addressableName,
-				Kind:       addressableKind,
-				APIVersion: addressableAPIVersion,
+			Sink: &duckv1beta1.Destination{
+				Ref: &corev1.ObjectReference{
+					Name:       addressableName,
+					Kind:       addressableKind,
+					APIVersion: addressableAPIVersion,
+				},
 			},
-		},
-	}
-	// selflink is not filled in when we create the object, so clear it
-	obj.ObjectMeta.SelfLink = ""
-	return obj
+		}),
+		WithCamelSourceSink(addressableURI),
+		WithCamelSourceDeploying()}, opts...)
+
+	return getBaseSource(opts...)
 }
 
 func withAlternativeContext(src *sourcesv1alpha1.CamelSource) *sourcesv1alpha1.CamelSource {
-	if src.Spec.Source.DeprecatedComponent != nil {
-		src.Spec.Source.DeprecatedComponent.Context = alternativeContextName
-	} else {
-		src.Spec.Source.Integration.Kit = alternativeContextName
+	if src.Spec.Source.Integration == nil {
+		src.Spec.Source.Integration = &camelv1.IntegrationSpec{}
 	}
+	src.Spec.Source.Integration.Kit = alternativeKitName
 	return src
 }
 
-func getContext() *camelv1alpha1.IntegrationKit {
-	return makeContext(testNS, alternativeImage)
-}
-
-func getAlternativeContext() *camelv1alpha1.IntegrationKit {
+func getAlternativeContext() *camelv1.IntegrationKit {
 	ctx := makeContext(testNS, alternativeImage)
-	ctx.Name = alternativeContextName
+	ctx.Name = alternativeKitName
 	return ctx
 }
 
-func makeContext(namespace string, image string) *camelv1alpha1.IntegrationKit {
-	ct := camelv1alpha1.IntegrationKit{
+func makeContext(namespace string, image string) *camelv1.IntegrationKit {
+	ct := camelv1.IntegrationKit{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "IntegrationKit",
-			APIVersion: "camel.apache.org/v1alpha1",
+			APIVersion: "camel.apache.org/v1",
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "ctx-",
 			Namespace:    namespace,
 			Labels: map[string]string{
 				"app":                       "camel-k",
-				"camel.apache.org/kit.type": camelv1alpha1.IntegrationKitTypeExternal,
+				"camel.apache.org/kit.type": camelv1.IntegrationKitTypeExternal,
 			},
 		},
-		Spec: camelv1alpha1.IntegrationKitSpec{
+		Spec: camelv1.IntegrationKitSpec{
 			Image:   image,
-			Profile: camelv1alpha1.TraitProfileKnative,
+			Profile: camelv1.TraitProfileKnative,
 		},
 	}
 	return &ct
 }
 
-func getRunningIntegration(t *testing.T) *camelv1alpha1.Integration {
-	it, err := resources.MakeIntegration(&resources.CamelArguments{
-		Name:      sourceName,
-		Namespace: testNS,
-		Sink:      addressableURI,
-		Source: sourcesv1alpha1.CamelSourceOriginSpec{
-			DeprecatedComponent: &sourcesv1alpha1.CamelSourceOriginComponentSpec{
-				URI: "timer:tick?period=3s",
-			},
-		},
-	})
-	if err != nil {
-		t.Error("failed to create integration", err)
-	}
-	it.ObjectMeta.OwnerReferences = getOwnerReferences()
-	it.Status.Phase = camelv1alpha1.IntegrationPhaseRunning
+func getRunningIntegration() *camelv1.Integration {
+	it := NewIntegration(sourceName, testNS, getBaseSource(WithCamelSourceSink(addressableURI)))
+
+	it.Status.Phase = camelv1.IntegrationPhaseRunning
 	return it
 }
 
-func integrationWithAlternativeContext(integration *camelv1alpha1.Integration) *camelv1alpha1.Integration {
-	integration.Spec.Kit = alternativeContextName
+func integrationWithAlternativeContext(integration *camelv1.Integration) *camelv1.Integration {
+	integration.Spec.Kit = alternativeKitName
 	return integration
 }
 
-func getRunningCamelKIntegration(t *testing.T) *camelv1alpha1.Integration {
+func getRunningCamelKIntegration(t *testing.T) *camelv1.Integration {
+	src := getCamelKSource()
 	it, err := resources.MakeIntegration(&resources.CamelArguments{
 		Name:      sourceName,
 		Namespace: testNS,
-		Sink:      addressableURI,
-		Source: sourcesv1alpha1.CamelSourceOriginSpec{
-			Integration: &camelv1alpha1.IntegrationSpec{
-				Sources: []camelv1alpha1.SourceSpec{
-					{
-						DataSpec: camelv1alpha1.DataSpec{
-							Name:    "integration.groovy",
-							Content: "from('timer:tick?period=3s').to('knative://endpoint/sink')",
-						},
-					},
-				},
-			},
-		},
+		SinkURL:   addressableURI,
+		Owner:     src,
+		Source:    src.Spec.Source,
 	})
 	if err != nil {
 		t.Error("failed to create integration", err)
 	}
-	it.ObjectMeta.OwnerReferences = getOwnerReferences()
-	it.Status.Phase = camelv1alpha1.IntegrationPhaseRunning
+	it.Status.Phase = camelv1.IntegrationPhaseRunning
 	return it
 }
 
-func getRunningCamelKFlowIntegration(t *testing.T) *camelv1alpha1.Integration {
+func getRunningCamelKFlowIntegration(t *testing.T) *camelv1.Integration {
+	src := getCamelKFlowSource()
 	it, err := resources.MakeIntegration(&resources.CamelArguments{
 		Name:      sourceName,
 		Namespace: testNS,
-		Sink:      addressableURI,
-		Source: sourcesv1alpha1.CamelSourceOriginSpec{
-			Integration: &camelv1alpha1.IntegrationSpec{
-				Sources: []camelv1alpha1.SourceSpec{
-					{
-						Language: camelv1alpha1.LanguageYaml,
-						DataSpec: camelv1alpha1.DataSpec{
-							Name:    "flow.yaml",
-							Content: "- from:\n    steps:\n    - set-body:\n        constant: Hello world\n    - to:\n        uri: knative://endpoint/sink\n    uri: timer:tick?period=3s\n",
-						},
-					},
-				},
-			},
-		},
+		SinkURL:   addressableURI,
+		Owner:     src,
+		Source:    src.Spec.Source,
 	})
 	if err != nil {
 		t.Error("failed to create integration", err)
 	}
-	it.ObjectMeta.OwnerReferences = getOwnerReferences()
-	it.Status.Phase = camelv1alpha1.IntegrationPhaseRunning
+	it.Status.Phase = camelv1.IntegrationPhaseRunning
 	return it
 }
 
-func getWrongIntegration(t *testing.T) *camelv1alpha1.Integration {
-	it := getRunningIntegration(t)
+func getWrongIntegration() *camelv1.Integration {
+	it := getRunningIntegration()
 	it.Spec.Sources[0].Content = "wrong"
 	return it
 }
 
-func getSourceWithNoSink() *sourcesv1alpha1.CamelSource {
-	src := getSource()
-	src.Status.InitializeConditions()
-	src.Status.MarkNoSink("NotFound", "")
-	return src
-}
+func getBaseSource(opts ...CamelSourceOption) *sourcesv1alpha1.CamelSource {
+	opts = append([]CamelSourceOption{
+		WithCamelSourceSpec(sourcesv1alpha1.CamelSourceSpec{
+			Source: sourcesv1alpha1.CamelSourceOriginSpec{
+				Flow: &sourcesv1alpha1.Flow{
+					"from": map[string]interface{}{
+						"uri": "timer:tick?period=3s",
+					},
+				},
+			},
+			Sink: &duckv1beta1.Destination{
+				Ref: &corev1.ObjectReference{
+					Name:       addressableName,
+					Kind:       addressableKind,
+					APIVersion: addressableAPIVersion,
+				},
+			},
+		})}, opts...)
 
-func withUpdatingIntegration(src *sourcesv1alpha1.CamelSource) *sourcesv1alpha1.CamelSource {
-	src.Status.InitializeConditions()
-	src.Status.MarkSink(addressableURI)
-	src.Status.MarkDeploying("IntegrationUpdated", "Updated integration ")
-	return src
-}
-
-func getDeployingSource() *sourcesv1alpha1.CamelSource {
-	src := getSource()
-	src.Status.InitializeConditions()
-	src.Status.MarkSink(addressableURI)
-	src.Status.MarkDeploying("Deploying", "Created integration ")
-	return src
-}
-
-func asDeployedSource(src *sourcesv1alpha1.CamelSource) *sourcesv1alpha1.CamelSource {
-	src.Status.InitializeConditions()
-	src.Status.MarkSink(addressableURI)
-	src.Status.MarkDeployed()
-	return src
-}
-
-func getDeletedSource() *sourcesv1alpha1.CamelSource {
-	src := getSource()
-	src.ObjectMeta.DeletionTimestamp = &deletionTime
-	return src
-}
-
-func om(namespace, name string, generation int64) metav1.ObjectMeta {
-	return metav1.ObjectMeta{
-		Namespace:  namespace,
-		Name:       name,
-		Generation: generation,
-		SelfLink:   fmt.Sprintf("/apis/eventing/sources/v1alpha1/namespaces/%s/object/%s", namespace, name),
-		UID:        sourceUID,
-	}
+	return NewCamelSource(sourceName, testNS, generation,
+		opts...)
 }
 
 func getAddressable() *unstructured.Unstructured {
@@ -558,20 +479,9 @@ func getAddressable() *unstructured.Unstructured {
 			},
 			"status": map[string]interface{}{
 				"address": map[string]interface{}{
-					"hostname": addressableDNS,
+					"url": addressableURI,
 				},
 			},
 		},
 	}
-}
-
-func getOwnerReferences() []metav1.OwnerReference {
-	return []metav1.OwnerReference{{
-		APIVersion:         sourcesv1alpha1.SchemeGroupVersion.String(),
-		Kind:               "CamelSource",
-		Name:               sourceName,
-		Controller:         &trueVal,
-		BlockOwnerDeletion: &trueVal,
-		UID:                sourceUID,
-	}}
 }

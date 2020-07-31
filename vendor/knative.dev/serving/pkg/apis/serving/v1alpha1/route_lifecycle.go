@@ -22,15 +22,20 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
+	"knative.dev/networking/pkg/apis/networking/v1alpha1"
 	"knative.dev/pkg/apis"
-	duckv1beta1 "knative.dev/pkg/apis/duck/v1beta1"
-	"knative.dev/serving/pkg/apis/networking/v1alpha1"
 )
 
 var routeCondSet = apis.NewLivingConditionSet(
 	RouteConditionAllTrafficAssigned,
 	RouteConditionIngressReady,
+	RouteConditionCertificateProvisioned,
 )
+
+// GetConditionSet retrieves the ConditionSet of the Route. Implements the KRShaped interface.
+func (*Route) GetConditionSet() apis.ConditionSet {
+	return routeCondSet
+}
 
 func (r *Route) GetGroupVersionKind() schema.GroupVersionKind {
 	return SchemeGroupVersion.WithKind("Route")
@@ -113,43 +118,45 @@ func (rs *RouteStatus) MarkMissingTrafficTarget(kind, name string) {
 }
 
 func (rs *RouteStatus) MarkCertificateProvisionFailed(name string) {
-	routeCondSet.Manage(rs).SetCondition(apis.Condition{
-		Type:     RouteConditionCertificateProvisioned,
-		Status:   corev1.ConditionFalse,
-		Severity: apis.ConditionSeverityWarning,
-		Reason:   "CertificateProvisionFailed",
-		Message:  fmt.Sprintf("Certificate %s fails to be provisioned.", name),
-	})
+	routeCondSet.Manage(rs).MarkFalse(RouteConditionCertificateProvisioned,
+		"CertificateProvisionFailed",
+		"Certificate %s fails to be provisioned.", name)
 }
 
 func (rs *RouteStatus) MarkCertificateReady(name string) {
-	routeCondSet.Manage(rs).SetCondition(apis.Condition{
-		Type:     RouteConditionCertificateProvisioned,
-		Status:   corev1.ConditionTrue,
-		Severity: apis.ConditionSeverityWarning,
-		Reason:   "CertificateReady",
-		Message:  fmt.Sprintf("Certificate %s is successfully provisioned", name),
-	})
+	routeCondSet.Manage(rs).MarkTrue(RouteConditionCertificateProvisioned)
 }
 
 func (rs *RouteStatus) MarkCertificateNotReady(name string) {
-	routeCondSet.Manage(rs).SetCondition(apis.Condition{
-		Type:     RouteConditionCertificateProvisioned,
-		Status:   corev1.ConditionUnknown,
-		Severity: apis.ConditionSeverityWarning,
-		Reason:   "CertificateNotReady",
-		Message:  fmt.Sprintf("Certificate %s is not ready.", name),
-	})
+	routeCondSet.Manage(rs).MarkUnknown(RouteConditionCertificateProvisioned,
+		"CertificateNotReady",
+		"Certificate %s is not ready.", name)
 }
 
 func (rs *RouteStatus) MarkCertificateNotOwned(name string) {
-	routeCondSet.Manage(rs).SetCondition(apis.Condition{
-		Type:     RouteConditionCertificateProvisioned,
-		Status:   corev1.ConditionFalse,
-		Severity: apis.ConditionSeverityWarning,
-		Reason:   "CertificateNotOwned",
-		Message:  fmt.Sprintf("There is an existing certificate %s that we don't own.", name),
-	})
+	routeCondSet.Manage(rs).MarkFalse(RouteConditionCertificateProvisioned,
+		"CertificateNotOwned",
+		"There is an existing certificate %s that we don't own.", name)
+}
+
+const (
+	AutoTLSNotEnabledMessage            = "autoTLS is not enabled"
+	TLSNotEnabledForClusterLocalMessage = "TLS is not enabled for cluster-local"
+)
+
+// MarkTLSNotEnabled sets RouteConditionCertificateProvisioned to true when
+// certificate config such as autoTLS is not enabled or private cluster-local service.
+func (rs *RouteStatus) MarkTLSNotEnabled(msg string) {
+	routeCondSet.Manage(rs).MarkTrueWithReason(RouteConditionCertificateProvisioned,
+		"TLSNotEnabled", msg)
+}
+
+// MarkHTTPDowngrade sets RouteConditionCertificateProvisioned to true when plain
+// HTTP is enabled even when Certificated is not ready.
+func (rs *RouteStatus) MarkHTTPDowngrade(name string) {
+	routeCondSet.Manage(rs).MarkTrueWithReason(RouteConditionCertificateProvisioned,
+		"HTTPDowngrade",
+		"Certificate %s is not ready downgrade HTTP.", name)
 }
 
 // PropagateIngressStatus update RouteConditionIngressReady condition
@@ -160,16 +167,14 @@ func (rs *RouteStatus) PropagateIngressStatus(cs v1alpha1.IngressStatus) {
 		rs.MarkIngressNotConfigured()
 		return
 	}
-	switch {
-	case cc.Status == corev1.ConditionUnknown:
-		routeCondSet.Manage(rs).MarkUnknown(RouteConditionIngressReady, cc.Reason, cc.Message)
-	case cc.Status == corev1.ConditionTrue:
-		routeCondSet.Manage(rs).MarkTrue(RouteConditionIngressReady)
-	case cc.Status == corev1.ConditionFalse:
-		routeCondSet.Manage(rs).MarkFalse(RouteConditionIngressReady, cc.Reason, cc.Message)
-	}
-}
 
-func (rs *RouteStatus) duck() *duckv1beta1.Status {
-	return &rs.Status
+	m := routeCondSet.Manage(rs)
+	switch cc.Status {
+	case corev1.ConditionTrue:
+		m.MarkTrue(RouteConditionIngressReady)
+	case corev1.ConditionFalse:
+		m.MarkFalse(RouteConditionIngressReady, cc.Reason, cc.Message)
+	case corev1.ConditionUnknown:
+		m.MarkUnknown(RouteConditionIngressReady, cc.Reason, cc.Message)
+	}
 }

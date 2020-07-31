@@ -20,83 +20,116 @@ import (
 	"fmt"
 	"testing"
 
-	"k8s.io/apimachinery/pkg/util/uuid"
-	"knative.dev/eventing/test/base/resources"
-	"knative.dev/eventing/test/common"
+	cloudevents "github.com/cloudevents/sdk-go/v2"
+	. "github.com/cloudevents/sdk-go/v2/test"
+	"github.com/google/uuid"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	testlib "knative.dev/eventing/test/lib"
+	"knative.dev/eventing/test/lib/recordevents"
+	"knative.dev/eventing/test/lib/resources"
 )
 
 // EventTransformationForSubscriptionTestHelper is the helper function for channel_event_tranformation_test
-func EventTransformationForSubscriptionTestHelper(t *testing.T, channelTestRunner common.ChannelTestRunner) {
+func EventTransformationForSubscriptionTestHelper(t *testing.T,
+	subscriptionVersion SubscriptionVersion,
+	channelTestRunner testlib.ComponentsTestRunner,
+	options ...testlib.SetupClientOption) {
 	senderName := "e2e-eventtransformation-sender"
 	channelNames := []string{"e2e-eventtransformation1", "e2e-eventtransformation2"}
+	eventSource := fmt.Sprintf("http://%s.svc/", senderName)
 	// subscriptionNames1 corresponds to Subscriptions on channelNames[0]
 	subscriptionNames1 := []string{"e2e-eventtransformation-subs11", "e2e-eventtransformation-subs12"}
 	// subscriptionNames2 corresponds to Subscriptions on channelNames[1]
 	subscriptionNames2 := []string{"e2e-eventtransformation-subs21", "e2e-eventtransformation-subs22"}
 	transformationPodName := "e2e-eventtransformation-transformation-pod"
-	loggerPodName := "e2e-eventtransformation-logger-pod"
+	recordEventsPodName := "e2e-eventtransformation-recordevents-pod"
 
-	channelTestRunner.RunTests(t, common.FeatureBasic, func(st *testing.T, channel string) {
-		client := common.Setup(st, true)
-		defer common.TearDown(client)
+	channelTestRunner.RunTests(t, testlib.FeatureBasic, func(st *testing.T, channel metav1.TypeMeta) {
+		client := testlib.Setup(st, true, options...)
+		defer testlib.TearDown(client)
 
 		// create channels
-		channelTypeMeta := common.GetChannelTypeMeta(channel)
-		client.CreateChannelsOrFail(channelNames, channelTypeMeta)
-		client.WaitForResourcesReady(channelTypeMeta)
+		client.CreateChannelsOrFail(channelNames, &channel)
+		client.WaitForResourcesReadyOrFail(&channel)
 
 		// create transformation pod and service
-		transformedEventBody := fmt.Sprintf("eventBody %s", uuid.NewUUID())
-		eventAfterTransformation := &resources.CloudEvent{
-			Source:   senderName,
-			Type:     resources.CloudEventDefaultType,
-			Data:     fmt.Sprintf(`{"msg":%q}`, transformedEventBody),
-			Encoding: resources.CloudEventDefaultEncoding,
+		eventAfterTransformation := cloudevents.NewEvent()
+		eventAfterTransformation.SetID("dummy-transformed")
+		eventAfterTransformation.SetSource(eventSource)
+		eventAfterTransformation.SetType(testlib.DefaultEventType)
+		transformedEventBody := fmt.Sprintf(`{"msg":"eventBody %s"}`, uuid.New().String())
+		if err := eventAfterTransformation.SetData(cloudevents.ApplicationJSON, []byte(transformedEventBody)); err != nil {
+			t.Fatalf("Cannot set the payload of the event: %s", err.Error())
 		}
-		transformationPod := resources.EventTransformationPod(transformationPodName, eventAfterTransformation)
-		client.CreatePodOrFail(transformationPod, common.WithService(transformationPodName))
-
-		// create logger pod and service
-		loggerPod := resources.EventLoggerPod(loggerPodName)
-		client.CreatePodOrFail(loggerPod, common.WithService(loggerPodName))
-
-		// create subscriptions that subscribe the first channel, use the transformation service to transform the events and then forward the transformed events to the second channel
-		client.CreateSubscriptionsOrFail(
-			subscriptionNames1,
-			channelNames[0],
-			channelTypeMeta,
-			resources.WithSubscriberForSubscription(transformationPodName),
-			resources.WithReplyForSubscription(channelNames[1], channelTypeMeta),
+		transformationPod := resources.EventTransformationPod(
+			transformationPodName,
+			eventAfterTransformation.Type(),
+			eventAfterTransformation.Source(),
+			eventAfterTransformation.Data(),
 		)
-		// create subscriptions that subscribe the second channel, and forward the received events to the logger service
-		client.CreateSubscriptionsOrFail(
-			subscriptionNames2,
-			channelNames[1],
-			channelTypeMeta,
-			resources.WithSubscriberForSubscription(loggerPodName),
-		)
+		client.CreatePodOrFail(transformationPod, testlib.WithService(transformationPodName))
+
+		// create event logger pod and service as the subscriber
+		eventTracker, _ := recordevents.StartEventRecordOrFail(client, recordEventsPodName)
+		defer eventTracker.Cleanup()
+
+		switch subscriptionVersion {
+		case SubscriptionV1:
+			// create subscriptions that subscribe the first channel, use the transformation service to transform the events and then forward the transformed events to the second channel
+			client.CreateSubscriptionsV1OrFail(
+				subscriptionNames1,
+				channelNames[0],
+				&channel,
+				resources.WithSubscriberForSubscriptionV1(transformationPodName),
+				resources.WithReplyForSubscriptionV1(channelNames[1], &channel),
+			)
+			// create subscriptions that subscribe the second channel, and forward the received events to the logger service
+			client.CreateSubscriptionsV1OrFail(
+				subscriptionNames2,
+				channelNames[1],
+				&channel,
+				resources.WithSubscriberForSubscriptionV1(recordEventsPodName),
+			)
+		case SubscriptionV1beta1:
+			// create subscriptions that subscribe the first channel, use the transformation service to transform the events and then forward the transformed events to the second channel
+			client.CreateSubscriptionsOrFail(
+				subscriptionNames1,
+				channelNames[0],
+				&channel,
+				resources.WithSubscriberForSubscription(transformationPodName),
+				resources.WithReplyForSubscription(channelNames[1], &channel),
+			)
+			// create subscriptions that subscribe the second channel, and forward the received events to the logger service
+			client.CreateSubscriptionsOrFail(
+				subscriptionNames2,
+				channelNames[1],
+				&channel,
+				resources.WithSubscriberForSubscription(recordEventsPodName),
+			)
+
+		default:
+			t.Fatalf("Invalid subscription version")
+		}
 
 		// wait for all test resources to be ready, so that we can start sending events
-		if err := client.WaitForAllTestResourcesReady(); err != nil {
-			st.Fatalf("Failed to get all test resources ready: %v", err)
-		}
+		client.WaitForAllTestResourcesReadyOrFail()
 
-		// send fake CloudEvent to the first channel
-		eventBody := fmt.Sprintf("TestEventTransformation %s", uuid.NewUUID())
-		eventToSend := &resources.CloudEvent{
-			Source:   senderName,
-			Type:     resources.CloudEventDefaultType,
-			Data:     fmt.Sprintf(`{"msg":%q}`, eventBody),
-			Encoding: resources.CloudEventDefaultEncoding,
+		// send  CloudEvent to the first channel
+		eventToSend := cloudevents.NewEvent()
+		eventToSend.SetID("dummy")
+		eventToSend.SetSource(eventSource)
+		eventToSend.SetType(testlib.DefaultEventType)
+		eventBody := fmt.Sprintf(`{"msg":"TestEventTransformation %s"}`, uuid.New().String())
+		if err := eventToSend.SetData(cloudevents.ApplicationJSON, []byte(eventBody)); err != nil {
+			t.Fatalf("Cannot set the payload of the event: %s", err.Error())
 		}
-		if err := client.SendFakeEventToAddressable(senderName, channelNames[0], channelTypeMeta, eventToSend); err != nil {
-			st.Fatalf("Failed to send fake CloudEvent to the channel %q", channelNames[0])
-		}
+		client.SendEventToAddressable(senderName, channelNames[0], &channel, eventToSend)
 
 		// check if the logging service receives the correct number of event messages
-		expectedContentCount := len(subscriptionNames1) * len(subscriptionNames2)
-		if err := client.CheckLog(loggerPodName, common.CheckerContainsCount(transformedEventBody, expectedContentCount)); err != nil {
-			st.Fatalf("String %q does not appear %d times in logs of logger pod %q: %v", transformedEventBody, expectedContentCount, loggerPodName, err)
-		}
+		eventTracker.AssertAtLeast(len(subscriptionNames1)*len(subscriptionNames2), recordevents.MatchEvent(
+			HasSource(eventSource),
+			HasData([]byte(transformedEventBody)),
+		))
 	})
 }

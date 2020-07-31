@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,9 +34,9 @@ type FakeCouchDbSources struct {
 	ns   string
 }
 
-var couchdbsourcesResource = schema.GroupVersionResource{Group: "sources.eventing.knative.dev", Version: "v1alpha1", Resource: "couchdbsources"}
+var couchdbsourcesResource = schema.GroupVersionResource{Group: "sources.knative.dev", Version: "v1alpha1", Resource: "couchdbsources"}
 
-var couchdbsourcesKind = schema.GroupVersionKind{Group: "sources.eventing.knative.dev", Version: "v1alpha1", Kind: "CouchDbSource"}
+var couchdbsourcesKind = schema.GroupVersionKind{Group: "sources.knative.dev", Version: "v1alpha1", Kind: "CouchDbSource"}
 
 // Get takes name of the couchDbSource, and returns the corresponding couchDbSource object, and an error if there is any.
 func (c *FakeCouchDbSources) Get(name string, options v1.GetOptions) (result *v1alpha1.CouchDbSource, err error) {
@@ -131,7 +131,7 @@ func (c *FakeCouchDbSources) DeleteCollection(options *v1.DeleteOptions, listOpt
 // Patch applies the patch and returns the patched couchDbSource.
 func (c *FakeCouchDbSources) Patch(name string, pt types.PatchType, data []byte, subresources ...string) (result *v1alpha1.CouchDbSource, err error) {
 	obj, err := c.Fake.
-		Invokes(testing.NewPatchSubresourceAction(couchdbsourcesResource, c.ns, name, data, subresources...), &v1alpha1.CouchDbSource{})
+		Invokes(testing.NewPatchSubresourceAction(couchdbsourcesResource, c.ns, name, pt, data, subresources...), &v1alpha1.CouchDbSource{})
 
 	if obj == nil {
 		return nil, err

@@ -48,7 +48,7 @@ rules:
   - patch
   - delete
 - apiGroups:
-  - sources.eventing.knative.dev
+  - sources.knative.dev
   resources:
   - couchdbsources
   verbs:
@@ -60,7 +60,7 @@ rules:
   - patch
   - delete
 - apiGroups:
-  - sources.eventing.knative.dev
+  - sources.knative.dev
   resources:
   - couchdbsources/status
   - couchdbsources/finalizers
@@ -72,14 +72,34 @@ rules:
   - ""
   resources:
   - secrets
+  - configmaps
   verbs:
   - get
   - list
   - watch
 
-# EventTypes admin
 - apiGroups:
-    - eventing.knative.dev
+  - coordination.k8s.io
   resources:
-    - eventtypes
+  - leases
   verbs: *everything
+
+---
+# The role is needed for the aggregated role source-observer in knative-eventing to provide readonly access to "Sources".
+# Ref: https://github.com/knative/eventing/tree/master/config/core/rolessource-observer-clusterrole.yaml.
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: eventing-contrib-couchdb-source-observer
+  labels:
+    eventing.knative.dev/release: devel
+    duck.knative.dev/source: "true"
+rules:
+  - apiGroups:
+      - "sources.knative.dev"
+    resources:
+      - "couchdbsources"
+    verbs:
+      - get
+      - list
+      - watch

@@ -1,5 +1,5 @@
 /*
- * Copyright 2018 The Knative Authors
+ * Copyright 2020 The Knative Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,209 +17,215 @@
 package channel
 
 import (
-	"bytes"
-	"errors"
+	"context"
 	"fmt"
-	"io/ioutil"
-	"net/http"
+	nethttp "net/http"
 	"net/url"
-	"strings"
 
-	"go.opencensus.io/plugin/ochttp"
-	"go.opencensus.io/plugin/ochttp/propagation/b3"
+	cloudevents "github.com/cloudevents/sdk-go/v2"
+	"github.com/cloudevents/sdk-go/v2/binding"
+	"github.com/cloudevents/sdk-go/v2/protocol/http"
 	"go.opencensus.io/trace"
 	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/util/sets"
+
+	"knative.dev/eventing/pkg/kncloudevents"
+	"knative.dev/eventing/pkg/tracing"
 	"knative.dev/eventing/pkg/utils"
 )
 
-const correlationIDHeaderName = "Knative-Correlation-Id"
-
-type Dispatcher interface {
-	// DispatchMessage dispatches a message to a destination over HTTP.
+type MessageDispatcher interface {
+	// DispatchMessage dispatches an event to a destination over HTTP.
 	//
-	// The destination and reply are DNS names. For names with a single label,
-	// the default namespace is used to expand it into a fully qualified name
-	// within the cluster.
-	DispatchMessage(message *Message, destination, reply string, defaults DispatchDefaults) error
+	// The destination and reply are URLs.
+	DispatchMessage(ctx context.Context, message cloudevents.Message, additionalHeaders nethttp.Header, destination *url.URL, reply *url.URL, deadLetter *url.URL) error
+
+	// DispatchMessageWithRetries dispatches an event to a destination over HTTP.
+	//
+	// The destination and reply are URLs.
+	DispatchMessageWithRetries(ctx context.Context, message cloudevents.Message, additionalHeaders nethttp.Header, destination *url.URL, reply *url.URL, deadLetter *url.URL, config *kncloudevents.RetryConfig) error
 }
 
-// MessageDispatcher is the 'real' Dispatcher used everywhere except unit tests.
-var _ Dispatcher = &MessageDispatcher{}
+// MessageDispatcherImpl is the 'real' MessageDispatcher used everywhere except unit tests.
+var _ MessageDispatcher = &MessageDispatcherImpl{}
 
-var propagation = &b3.HTTPFormat{}
-
-// MessageDispatcher dispatches messages to a destination over HTTP.
-type MessageDispatcher struct {
-	httpClient       *http.Client
-	forwardHeaders   sets.String
-	forwardPrefixes  []string
+// MessageDispatcherImpl dispatches events to a destination over HTTP.
+type MessageDispatcherImpl struct {
+	sender           *kncloudevents.HttpMessageSender
 	supportedSchemes sets.String
 
-	logger *zap.SugaredLogger
+	logger *zap.Logger
 }
 
-// DispatchDefaults provides default parameter values used when dispatching a message.
-type DispatchDefaults struct {
-	Namespace string
+// NewMessageDispatcher creates a new Message dispatcher that can dispatch
+// events to HTTP destinations.
+func NewMessageDispatcher(logger *zap.Logger) *MessageDispatcherImpl {
+	return NewMessageDispatcherFromConfig(logger, defaultEventDispatcherConfig)
 }
 
-// NewMessageDispatcher creates a new message dispatcher that can dispatch
-// messages to HTTP destinations.
-func NewMessageDispatcher(logger *zap.SugaredLogger) *MessageDispatcher {
-	return &MessageDispatcher{
-		httpClient: &http.Client{
-			Transport: &ochttp.Transport{
-				Propagation: propagation,
-			},
-		},
-		forwardHeaders:   sets.NewString(forwardHeaders...),
-		forwardPrefixes:  forwardPrefixes,
+// NewMessageDispatcherFromConfig creates a new Message dispatcher based on config.
+func NewMessageDispatcherFromConfig(logger *zap.Logger, config EventDispatcherConfig) *MessageDispatcherImpl {
+	sender, err := kncloudevents.NewHttpMessageSender(&config.ConnectionArgs, "")
+	if err != nil {
+		logger.Fatal("Unable to create cloudevents binding sender", zap.Error(err))
+	}
+	return NewMessageDispatcherFromSender(logger, sender)
+}
+
+// NewMessageDispatcherFromConfig creates a new event dispatcher.
+func NewMessageDispatcherFromSender(logger *zap.Logger, sender *kncloudevents.HttpMessageSender) *MessageDispatcherImpl {
+	return &MessageDispatcherImpl{
+		sender:           sender,
 		supportedSchemes: sets.NewString("http", "https"),
 		logger:           logger,
 	}
 }
 
-// DispatchMessage dispatches a message to a destination over HTTP.
-//
-// The destination and reply are DNS names. For names with a single label,
-// the default namespace is used to expand it into a fully qualified name
-// within the cluster.
-func (d *MessageDispatcher) DispatchMessage(message *Message, destination, reply string, defaults DispatchDefaults) error {
-	var err error
-	// Default to replying with the original message. If there is a destination, then replace it
-	// with the response from the call to the destination instead.
-	response := message
-	if destination != "" {
-		destinationURL := d.resolveURL(destination, defaults.Namespace)
-		response, err = d.executeRequest(destinationURL, message)
-		if err != nil {
-			return fmt.Errorf("Unable to complete request %v", err)
+func (d *MessageDispatcherImpl) DispatchMessage(ctx context.Context, message cloudevents.Message, additionalHeaders nethttp.Header, destination *url.URL, reply *url.URL, deadLetter *url.URL) error {
+	return d.DispatchMessageWithRetries(ctx, message, additionalHeaders, destination, reply, deadLetter, nil)
+}
+
+func (d *MessageDispatcherImpl) DispatchMessageWithRetries(ctx context.Context, message cloudevents.Message, additionalHeaders nethttp.Header, destination *url.URL, reply *url.URL, deadLetter *url.URL, retriesConfig *kncloudevents.RetryConfig) error {
+
+	// All messages that should be finished at the end of this function
+	// are placed in this slice
+	var messagesToFinish []binding.Message
+	defer func() {
+		for _, msg := range messagesToFinish {
+			_ = msg.Finish(nil)
 		}
+	}()
+
+	// sanitize eventual host-only URLs
+	destination = d.sanitizeURL(destination)
+	reply = d.sanitizeURL(reply)
+	deadLetter = d.sanitizeURL(deadLetter)
+
+	// If there is a destination, variables response* are filled with the response of the destination
+	// Otherwise, they are filled with the original message
+	var responseMessage cloudevents.Message
+	var responseAdditionalHeaders nethttp.Header
+
+	if destination != nil {
+		var err error
+		// Try to send to destination
+		messagesToFinish = append(messagesToFinish, message)
+
+		ctx, responseMessage, responseAdditionalHeaders, err = d.executeRequest(ctx, destination, message, additionalHeaders, retriesConfig)
+		if err != nil {
+			// DeadLetter is configured, send the message to it
+			if deadLetter != nil {
+
+				_, deadLetterResponse, _, deadLetterErr := d.executeRequest(ctx, deadLetter, message, additionalHeaders, retriesConfig)
+				if deadLetterErr != nil {
+					return fmt.Errorf("unable to complete request to either %s (%v) or %s (%v)", destination, err, deadLetter, deadLetterErr)
+				}
+				if deadLetterResponse != nil {
+					messagesToFinish = append(messagesToFinish, deadLetterResponse)
+				}
+
+				return nil
+			}
+			// No DeadLetter, just fail
+			return fmt.Errorf("unable to complete request to %s: %v", destination, err)
+		}
+	} else {
+		// No destination url, try to send to reply if available
+		responseMessage = message
+		responseAdditionalHeaders = additionalHeaders
 	}
 
-	if reply != "" && response != nil {
-		replyURL := d.resolveURL(reply, defaults.Namespace)
-		_, err = d.executeRequest(replyURL, response)
-		if err != nil {
-			return fmt.Errorf("Failed to forward reply %v", err)
-		}
+	// No response, dispatch completed
+	if responseMessage == nil {
+		return nil
 	}
+
+	messagesToFinish = append(messagesToFinish, responseMessage)
+
+	if reply == nil {
+		d.logger.Debug("cannot forward response as reply is empty")
+		return nil
+	}
+
+	ctx, responseResponseMessage, _, err := d.executeRequest(ctx, reply, responseMessage, responseAdditionalHeaders, retriesConfig)
+	if err != nil {
+		// DeadLetter is configured, send the message to it
+		if deadLetter != nil {
+			_, deadLetterResponse, _, deadLetterErr := d.executeRequest(ctx, deadLetter, message, responseAdditionalHeaders, retriesConfig)
+			if deadLetterErr != nil {
+				return fmt.Errorf("failed to forward reply to %s (%v) and failed to send it to the dead letter sink %s (%v)", reply, err, deadLetter, deadLetterErr)
+			}
+			if deadLetterResponse != nil {
+				messagesToFinish = append(messagesToFinish, deadLetterResponse)
+			}
+
+			return nil
+		}
+		// No DeadLetter, just fail
+		return fmt.Errorf("failed to forward reply to %s: %v", reply, err)
+	}
+	if responseResponseMessage != nil {
+		messagesToFinish = append(messagesToFinish, responseResponseMessage)
+	}
+
 	return nil
 }
 
-func (d *MessageDispatcher) executeRequest(url *url.URL, message *Message) (*Message, error) {
-	d.logger.Infof("Dispatching message to %s", url.String())
-	req, err := http.NewRequest(http.MethodPost, url.String(), bytes.NewReader(message.Payload))
-	if err != nil {
-		return nil, fmt.Errorf("unable to create request %v", err)
-	}
-	req.Header = d.toHTTPHeaders(message.Headers)
+func (d *MessageDispatcherImpl) executeRequest(ctx context.Context, url *url.URL, message cloudevents.Message, additionalHeaders nethttp.Header, configs *kncloudevents.RetryConfig) (context.Context, cloudevents.Message, nethttp.Header, error) {
+	d.logger.Debug("Dispatching event", zap.String("url", url.String()))
 
-	// Attach the Span context that is currently saved in the request's headers.
-	if sc, ok := propagation.SpanContextFromRequest(req); ok {
-		newCtx, _ := trace.StartSpanWithRemoteParent(req.Context(), req.URL.Path, sc)
-		req = req.WithContext(newCtx)
+	ctx, span := trace.StartSpan(ctx, "knative.dev", trace.WithSpanKind(trace.SpanKindClient))
+	defer span.End()
+
+	req, err := d.sender.NewCloudEventRequestWithTarget(ctx, url.String())
+	if err != nil {
+		return ctx, nil, nil, err
 	}
 
-	res, err := d.httpClient.Do(req)
+	if span.IsRecordingEvents() {
+		err = kncloudevents.WriteHttpRequestWithAdditionalHeaders(ctx, message, req, additionalHeaders, tracing.PopulateSpan(span))
+	} else {
+		err = kncloudevents.WriteHttpRequestWithAdditionalHeaders(ctx, message, req, additionalHeaders)
+	}
 	if err != nil {
-		return nil, err
+		return ctx, nil, nil, err
 	}
-	if res == nil {
-		// I don't think this is actually reachable with http.Client.Do(), but just to be sure we
-		// check anyway.
-		return nil, errors.New("non-error nil result from http.Client.Do()")
-	}
-	defer res.Body.Close()
-	if isFailure(res.StatusCode) {
-		// reject non-successful responses
-		return nil, fmt.Errorf("unexpected HTTP response, expected 2xx, got %d", res.StatusCode)
-	}
-	headers := d.fromHTTPHeaders(res.Header)
-	// TODO: add configurable whitelisting of propagated headers/prefixes (configmap?)
-	if correlationID, ok := message.Headers[correlationIDHeaderName]; ok {
-		headers[correlationIDHeaderName] = correlationID
-	}
-	payload, err := ioutil.ReadAll(res.Body)
+
+	response, err := d.sender.SendWithRetries(req, configs)
 	if err != nil {
-		return nil, fmt.Errorf("Unable to read response %v", err)
+		return ctx, nil, nil, err
 	}
-	if len(payload) == 0 {
-		// The response body is empty, the event has 'finished'.
-		return nil, nil
+	if isFailure(response.StatusCode) {
+		_ = response.Body.Close()
+		// Reject non-successful responses.
+		return ctx, nil, nil, fmt.Errorf("unexpected HTTP response, expected 2xx, got %d", response.StatusCode)
 	}
-	return &Message{headers, payload}, nil
+	responseMessage := http.NewMessageFromHttpResponse(response)
+	if responseMessage.ReadEncoding() == binding.EncodingUnknown {
+		_ = response.Body.Close()
+		d.logger.Debug("Response is a non event, discarding it", zap.Int("status_code", response.StatusCode))
+		return ctx, nil, nil, nil
+	}
+	return ctx, responseMessage, utils.PassThroughHeaders(response.Header), nil
+}
+
+func (d *MessageDispatcherImpl) sanitizeURL(u *url.URL) *url.URL {
+	if u == nil {
+		return nil
+	}
+	if d.supportedSchemes.Has(u.Scheme) {
+		// Already a URL with a known scheme.
+		return u
+	}
+	return &url.URL{
+		Scheme: "http",
+		Host:   u.Host,
+		Path:   "/",
+	}
 }
 
 // isFailure returns true if the status code is not a successful HTTP status.
 func isFailure(statusCode int) bool {
-	return statusCode < http.StatusOK /* 200 */ ||
-		statusCode >= http.StatusMultipleChoices /* 300 */
-}
-
-// toHTTPHeaders converts message headers to HTTP headers.
-//
-// Only headers whitelisted as safe are copied.
-func (d *MessageDispatcher) toHTTPHeaders(headers map[string]string) http.Header {
-	safe := http.Header{}
-
-	for name, value := range headers {
-		// Header names are case insensitive. Be sure to compare against a lower-cased version
-		// (all our oracles are lower-case as well).
-		name = strings.ToLower(name)
-		if d.forwardHeaders.Has(name) {
-			safe.Add(name, value)
-			continue
-		}
-		for _, prefix := range d.forwardPrefixes {
-			if strings.HasPrefix(name, prefix) {
-				safe.Add(name, value)
-				break
-			}
-		}
-	}
-
-	return safe
-}
-
-// fromHTTPHeaders converts HTTP headers into a message header map.
-//
-// Only headers whitelisted as safe are copied. If an HTTP header exists
-// multiple times, a single value will be retained.
-func (d *MessageDispatcher) fromHTTPHeaders(headers http.Header) map[string]string {
-	safe := map[string]string{}
-
-	// TODO handle multi-value headers
-	for h, v := range headers {
-		// Headers are case-insensitive but test case are all lower-case
-		comparable := strings.ToLower(h)
-		if d.forwardHeaders.Has(comparable) {
-			safe[h] = v[0]
-			continue
-		}
-		for _, p := range d.forwardPrefixes {
-			if strings.HasPrefix(comparable, p) {
-				safe[h] = v[0]
-				break
-			}
-		}
-	}
-
-	return safe
-}
-
-func (d *MessageDispatcher) resolveURL(destination string, defaultNamespace string) *url.URL {
-	if url, err := url.Parse(destination); err == nil && d.supportedSchemes.Has(url.Scheme) {
-		// Already a URL with a known scheme.
-		return url
-	}
-	if strings.Index(destination, ".") == -1 {
-		destination = fmt.Sprintf("%s.%s.svc.%s", destination, defaultNamespace, utils.GetClusterDomainName())
-	}
-	return &url.URL{
-		Scheme: "http",
-		Host:   destination,
-		Path:   "/",
-	}
+	return statusCode < nethttp.StatusOK /* 200 */ ||
+		statusCode >= nethttp.StatusMultipleChoices /* 300 */
 }

@@ -23,25 +23,30 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	cloudevents "github.com/cloudevents/sdk-go/v2"
+
 	"go.uber.org/zap"
 
 	"github.com/aws/aws-sdk-go/service/sqs"
 )
 
 func TestPostMessage_ServeHTTP(t *testing.T) {
-	timestamp := "1542107977907705474"
+	//Millisecond unix timestamp
+	timestamp := "1542107977907"
 	testCases := map[string]struct {
 		sink    func(http.ResponseWriter, *http.Request)
 		reqBody string
 		error   bool
 	}{
 		"happy": {
-			sink:    sinkAccepted,
-			reqBody: `{"Attributes":{"SentTimestamp":"1542107977907705474"},"Body":"The body","MD5OfBody":null,"MD5OfMessageAttributes":null,"MessageAttributes":null,"MessageId":"ABC01","ReceiptHandle":null}`,
+			sink: sinkAccepted,
+			//Millisecond unix timestamp
+			reqBody: `{"Attributes":{"SentTimestamp":"1542107977907"},"Body":"The body","MD5OfBody":null,"MD5OfMessageAttributes":null,"MessageAttributes":null,"MessageId":"ABC01","ReceiptHandle":null}`,
 		},
 		"rejected": {
-			sink:    sinkRejected,
-			reqBody: `{"Attributes":{"SentTimestamp":"1542107977907705474"},"Body":"The body","MD5OfBody":null,"MD5OfMessageAttributes":null,"MessageAttributes":null,"MessageId":"ABC01","ReceiptHandle":null}`,
+			sink: sinkRejected,
+			//Millisecond unix timestamp
+			reqBody: `{"Attributes":{"SentTimestamp":"1542107977907"},"Body":"The body","MD5OfBody":null,"MD5OfMessageAttributes":null,"MessageAttributes":null,"MessageId":"ABC01","ReceiptHandle":null}`,
 			error:   true,
 		},
 	}
@@ -59,6 +64,8 @@ func TestPostMessage_ServeHTTP(t *testing.T) {
 				OnFailedPollWaitSecs: 1,
 			}
 
+			ctx := cloudevents.ContextWithTarget(context.Background(), sinkServer.URL)
+
 			if err := a.initClient(); err != nil {
 				t.Errorf("failed to create cloudevent client, %v", err)
 			}
@@ -73,10 +80,12 @@ func TestPostMessage_ServeHTTP(t *testing.T) {
 				Body:       &body,
 				Attributes: attrs,
 			}
-			err := a.postMessage(context.TODO(), zap.S(), m)
+			err := a.postMessage(ctx, zap.S(), m)
 
 			if tc.error && err == nil {
 				t.Errorf("expected error, but got %v", err)
+			} else if !tc.error && err != nil {
+				t.Errorf("expected no error, but got %v", err)
 			}
 
 			if tc.reqBody != string(h.body) {
@@ -105,7 +114,8 @@ func TestReceiveMessage_ServeHTTP(t *testing.T) {
 
 	id := "ABC01"
 	body := "the body"
-	timestamp := "1542107977907705474"
+	//Millisecond unix timestamp
+	timestamp := "1542107977907"
 	m := &sqs.Message{
 		MessageId:  &id,
 		Body:       &body,

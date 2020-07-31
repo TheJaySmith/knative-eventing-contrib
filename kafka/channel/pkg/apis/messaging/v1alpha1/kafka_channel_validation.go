@@ -20,11 +20,25 @@ import (
 	"context"
 	"fmt"
 
+	"knative.dev/eventing/pkg/apis/eventing"
 	"knative.dev/pkg/apis"
 )
 
 func (c *KafkaChannel) Validate(ctx context.Context) *apis.FieldError {
-	return c.Spec.Validate(ctx).ViaField("spec")
+	errs := c.Spec.Validate(ctx).ViaField("spec")
+
+	// Validate annotations
+	if c.Annotations != nil {
+		if scope, ok := c.Annotations[eventing.ScopeAnnotationKey]; ok {
+			if scope != "namespace" && scope != "cluster" {
+				iv := apis.ErrInvalidValue(scope, "")
+				iv.Details = "expected either 'cluster' or 'namespace'"
+				errs = errs.Also(iv.ViaFieldKey("annotations", eventing.ScopeAnnotationKey).ViaField("metadata"))
+			}
+		}
+	}
+
+	return errs
 }
 
 func (cs *KafkaChannelSpec) Validate(ctx context.Context) *apis.FieldError {
@@ -42,7 +56,7 @@ func (cs *KafkaChannelSpec) Validate(ctx context.Context) *apis.FieldError {
 
 	if cs.Subscribable != nil {
 		for i, subscriber := range cs.Subscribable.Subscribers {
-			if subscriber.ReplyURI == "" && subscriber.SubscriberURI == "" {
+			if subscriber.ReplyURI == nil && subscriber.SubscriberURI == nil {
 				fe := apis.ErrMissingField("replyURI", "subscriberURI")
 				fe.Details = "expected at least one of, got none"
 				errs = errs.Also(fe.ViaField(fmt.Sprintf("subscriber[%d]", i)).ViaField("subscribable"))

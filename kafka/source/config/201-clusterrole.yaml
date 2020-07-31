@@ -21,7 +21,7 @@ metadata:
 rules:
 
 - apiGroups:
-  - sources.eventing.knative.dev
+  - sources.knative.dev
   resources:
   - kafkasources
   - kafkasources/finalizers
@@ -35,13 +35,38 @@ rules:
   - delete
 
 - apiGroups:
-  - sources.eventing.knative.dev
+  - sources.knative.dev
   resources:
   - kafkasources/status
   verbs:
   - get
   - update
   - patch
+
+
+- apiGroups:
+  - bindings.knative.dev
+  resources:
+  - kafkabindings
+  - kafkabindings/finalizers
+  verbs: &everything
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+
+- apiGroups:
+  - bindings.knative.dev
+  resources:
+  - kafkabindings/status
+  verbs:
+  - get
+  - update
+  - patch
+
 
 - apiGroups:
   - apps
@@ -61,9 +86,71 @@ rules:
   - secrets
   verbs: *everything
 
+# let the webhook label the appropriate namespace
 - apiGroups:
-  - eventing.knative.dev
+  - ""
   resources:
-  - eventtypes
+  - namespaces
+  verbs:
+  - get
+  - create
+  - update
+  - list
+  - watch
+  - patch
+
+- apiGroups:
+  - "coordination.k8s.io"
+  resources:
+  - leases
   verbs: *everything
 
+# For actually registering our webhook.
+- apiGroups:
+    - "admissionregistration.k8s.io"
+  resources:
+    - "mutatingwebhookconfigurations"
+    - "validatingwebhookconfigurations"
+  verbs: &everything
+    - "get"
+    - "list"
+    - "create"
+    - "update"
+    - "delete"
+    - "patch"
+    - "watch"
+
+# Necessary for conversion webhook. These are copied from the serving
+# TODO: Do we really need all these permissions?
+- apiGroups:
+    - "apiextensions.k8s.io"
+  resources:
+    - "customresourcedefinitions"
+  verbs:
+    - "get"
+    - "list"
+    - "create"
+    - "update"
+    - "delete"
+    - "patch"
+    - "watch"
+
+---
+# The role is needed for the aggregated role source-observer in knative-eventing to provide readonly access to "Sources".
+# Ref: https://github.com/knative/eventing/tree/master/config/core/rolessource-observer-clusterrole.yaml.
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: eventing-contrib-kafka-source-observer
+  labels:
+    eventing.knative.dev/release: devel
+    duck.knative.dev/source: "true"
+rules:
+  - apiGroups:
+      - "sources.knative.dev"
+    resources:
+      - "kafkasources"
+    verbs:
+      - get
+      - list
+      - watch

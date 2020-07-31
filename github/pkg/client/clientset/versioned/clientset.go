@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,34 +19,36 @@ limitations under the License.
 package versioned
 
 import (
+	"fmt"
+
 	discovery "k8s.io/client-go/discovery"
 	rest "k8s.io/client-go/rest"
 	flowcontrol "k8s.io/client-go/util/flowcontrol"
+	bindingsv1alpha1 "knative.dev/eventing-contrib/github/pkg/client/clientset/versioned/typed/bindings/v1alpha1"
 	sourcesv1alpha1 "knative.dev/eventing-contrib/github/pkg/client/clientset/versioned/typed/sources/v1alpha1"
 )
 
 type Interface interface {
 	Discovery() discovery.DiscoveryInterface
+	BindingsV1alpha1() bindingsv1alpha1.BindingsV1alpha1Interface
 	SourcesV1alpha1() sourcesv1alpha1.SourcesV1alpha1Interface
-	// Deprecated: please explicitly pick a version if possible.
-	Sources() sourcesv1alpha1.SourcesV1alpha1Interface
 }
 
 // Clientset contains the clients for groups. Each group has exactly one
 // version included in a Clientset.
 type Clientset struct {
 	*discovery.DiscoveryClient
-	sourcesV1alpha1 *sourcesv1alpha1.SourcesV1alpha1Client
+	bindingsV1alpha1 *bindingsv1alpha1.BindingsV1alpha1Client
+	sourcesV1alpha1  *sourcesv1alpha1.SourcesV1alpha1Client
+}
+
+// BindingsV1alpha1 retrieves the BindingsV1alpha1Client
+func (c *Clientset) BindingsV1alpha1() bindingsv1alpha1.BindingsV1alpha1Interface {
+	return c.bindingsV1alpha1
 }
 
 // SourcesV1alpha1 retrieves the SourcesV1alpha1Client
 func (c *Clientset) SourcesV1alpha1() sourcesv1alpha1.SourcesV1alpha1Interface {
-	return c.sourcesV1alpha1
-}
-
-// Deprecated: Sources retrieves the default version of SourcesClient.
-// Please explicitly pick a version.
-func (c *Clientset) Sources() sourcesv1alpha1.SourcesV1alpha1Interface {
 	return c.sourcesV1alpha1
 }
 
@@ -59,13 +61,22 @@ func (c *Clientset) Discovery() discovery.DiscoveryInterface {
 }
 
 // NewForConfig creates a new Clientset for the given config.
+// If config's RateLimiter is not set and QPS and Burst are acceptable,
+// NewForConfig will generate a rate-limiter in configShallowCopy.
 func NewForConfig(c *rest.Config) (*Clientset, error) {
 	configShallowCopy := *c
 	if configShallowCopy.RateLimiter == nil && configShallowCopy.QPS > 0 {
+		if configShallowCopy.Burst <= 0 {
+			return nil, fmt.Errorf("Burst is required to be greater than 0 when RateLimiter is not set and QPS is set to greater than 0")
+		}
 		configShallowCopy.RateLimiter = flowcontrol.NewTokenBucketRateLimiter(configShallowCopy.QPS, configShallowCopy.Burst)
 	}
 	var cs Clientset
 	var err error
+	cs.bindingsV1alpha1, err = bindingsv1alpha1.NewForConfig(&configShallowCopy)
+	if err != nil {
+		return nil, err
+	}
 	cs.sourcesV1alpha1, err = sourcesv1alpha1.NewForConfig(&configShallowCopy)
 	if err != nil {
 		return nil, err
@@ -82,6 +93,7 @@ func NewForConfig(c *rest.Config) (*Clientset, error) {
 // panics if there is an error in the config.
 func NewForConfigOrDie(c *rest.Config) *Clientset {
 	var cs Clientset
+	cs.bindingsV1alpha1 = bindingsv1alpha1.NewForConfigOrDie(c)
 	cs.sourcesV1alpha1 = sourcesv1alpha1.NewForConfigOrDie(c)
 
 	cs.DiscoveryClient = discovery.NewDiscoveryClientForConfigOrDie(c)
@@ -91,6 +103,7 @@ func NewForConfigOrDie(c *rest.Config) *Clientset {
 // New creates a new Clientset for the given RESTClient.
 func New(c rest.Interface) *Clientset {
 	var cs Clientset
+	cs.bindingsV1alpha1 = bindingsv1alpha1.New(c)
 	cs.sourcesV1alpha1 = sourcesv1alpha1.New(c)
 
 	cs.DiscoveryClient = discovery.NewDiscoveryClient(c)

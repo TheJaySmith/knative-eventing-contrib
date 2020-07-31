@@ -17,94 +17,59 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	"github.com/Shopify/sarama"
-	"k8s.io/apimachinery/pkg/runtime"
-	. "knative.dev/eventing-contrib/kafka/channel/pkg/utils"
-	"knative.dev/eventing/pkg/utils"
-	"knative.dev/pkg/kmeta"
+
+	"go.uber.org/zap"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	kubeinformers "k8s.io/client-go/informers"
-	fakekubeclientset "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
 	clientgotesting "k8s.io/client-go/testing"
-	"knative.dev/eventing-contrib/kafka/channel/pkg/apis/messaging/v1alpha1"
-	fakeclientset "knative.dev/eventing-contrib/kafka/channel/pkg/client/clientset/versioned/fake"
-	informers "knative.dev/eventing-contrib/kafka/channel/pkg/client/informers/externalversions"
-	"knative.dev/eventing-contrib/kafka/channel/pkg/reconciler"
-	"knative.dev/eventing-contrib/kafka/channel/pkg/reconciler/controller/resources"
-	reconciletesting "knative.dev/eventing-contrib/kafka/channel/pkg/reconciler/testing"
+
+	eventingClient "knative.dev/eventing/pkg/client/injection/client"
+	"knative.dev/eventing/pkg/utils"
+
 	duckv1alpha1 "knative.dev/pkg/apis/duck/v1alpha1"
+	kubeclient "knative.dev/pkg/client/injection/kube/client"
+	"knative.dev/pkg/configmap"
 	"knative.dev/pkg/controller"
+	"knative.dev/pkg/kmeta"
+	"knative.dev/pkg/logging"
 	logtesting "knative.dev/pkg/logging/testing"
 	. "knative.dev/pkg/reconciler/testing"
+
+	"knative.dev/eventing-contrib/kafka/channel/pkg/apis/messaging/v1alpha1"
+	fakekafkaclient "knative.dev/eventing-contrib/kafka/channel/pkg/client/injection/client/fake"
+	"knative.dev/eventing-contrib/kafka/channel/pkg/client/injection/reconciler/messaging/v1alpha1/kafkachannel"
+	"knative.dev/eventing-contrib/kafka/channel/pkg/reconciler/controller/resources"
+	reconcilekafkatesting "knative.dev/eventing-contrib/kafka/channel/pkg/reconciler/testing"
+	reconcilertesting "knative.dev/eventing-contrib/kafka/channel/pkg/reconciler/testing"
+	. "knative.dev/eventing-contrib/kafka/channel/pkg/utils"
 )
 
 const (
-	systemNS                 = "knative-eventing"
-	testNS                   = "test-namespace"
-	kcName                   = "test-kc"
-	dispatcherDeploymentName = "test-deployment"
-	dispatcherServiceName    = "test-service"
-	channelServiceAddress    = "test-kc-kn-channel.test-namespace.svc.cluster.local"
-	brokerName               = "test-broker"
+	testNS                = "test-namespace"
+	kcName                = "test-kc"
+	testDispatcherImage   = "test-image"
+	channelServiceAddress = "test-kc-kn-channel.test-namespace.svc.cluster.local"
+	brokerName            = "test-broker"
+	finalizerName         = "kafkachannels.messaging.knative.dev"
 )
 
 var (
-	trueVal = true
-	// deletionTime is used when objects are marked as deleted. Rfc3339Copy()
-	// truncates to seconds to match the loss of precision during serialization.
-	deletionTime = metav1.Now().Rfc3339Copy()
+	finalizerUpdatedEvent = Eventf(corev1.EventTypeNormal, "FinalizerUpdate", `Updated "test-kc" finalizers`)
 )
 
 func init() {
 	// Add types to scheme
 	_ = v1alpha1.AddToScheme(scheme.Scheme)
 	_ = duckv1alpha1.AddToScheme(scheme.Scheme)
-}
-
-func TestNewController(t *testing.T) {
-	kubeClient := fakekubeclientset.NewSimpleClientset()
-	messagingClient := fakeclientset.NewSimpleClientset()
-
-	// Create informer factories with fake clients. The second parameter sets the
-	// resync period to zero, disabling it.
-	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, 0)
-	messagingInformerFactory := informers.NewSharedInformerFactory(messagingClient, 0)
-
-	// Eventing
-	ncInformer := messagingInformerFactory.Messaging().V1alpha1().KafkaChannels()
-
-	// Kube
-	serviceInformer := kubeInformerFactory.Core().V1().Services()
-	endpointsInformer := kubeInformerFactory.Core().V1().Endpoints()
-	deploymentInformer := kubeInformerFactory.Apps().V1().Deployments()
-
-	kafkaConfig := &KafkaConfig{}
-
-	c := NewController(
-		reconciler.Options{
-			KubeClientSet:  kubeClient,
-			KafkaClientSet: messagingClient,
-			Logger:         logtesting.TestLogger(t),
-		},
-		kafkaConfig,
-		systemNS,
-		dispatcherDeploymentName,
-		dispatcherServiceName,
-		ncInformer,
-		deploymentInformer,
-		serviceInformer,
-		endpointsInformer)
-
-	if c == nil {
-		t.Fatalf("Failed to create with NewController")
-	}
 }
 
 func TestAllCases(t *testing.T) {
@@ -122,58 +87,68 @@ func TestAllCases(t *testing.T) {
 			Name: "deleting",
 			Key:  kcKey,
 			Objects: []runtime.Object{
-				reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithInitKafkaChannelConditions,
-					reconciletesting.WithKafkaChannelDeleted)},
+				reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithInitKafkaChannelConditions,
+					reconcilekafkatesting.WithKafkaChannelDeleted)},
 			WantErr: false,
-			WantUpdates: []clientgotesting.UpdateActionImpl{{
-				Object: reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithInitKafkaChannelConditions,
-					reconciletesting.WithKafkaChannelDeleted),
-			}},
 			WantEvents: []string{
-				Eventf(corev1.EventTypeNormal, channelReconciled, "KafkaChannel reconciled"),
+				Eventf(corev1.EventTypeNormal, "KafkaChannelReconciled", `KafkaChannel reconciled: "test-namespace/test-kc"`),
 			},
 		}, {
-			Name: "deployment does not exist, and patching finalizers",
+			Name: "deployment does not exist, automatically created and patching finalizers",
 			Key:  kcKey,
 			Objects: []runtime.Object{
-				reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithInitKafkaChannelConditions,
-					reconciletesting.WithKafkaChannelTopicReady()),
+				reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithInitKafkaChannelConditions,
+					reconcilekafkatesting.WithKafkaChannelTopicReady()),
 			},
 			WantErr: true,
+			WantCreates: []runtime.Object{
+				makeDeployment(),
+				makeService(),
+			},
 			WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
-				Object: reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithInitKafkaChannelConditions,
-					reconciletesting.WithKafkaChannelTopicReady(),
-					reconciletesting.WithKafkaChannelDeploymentNotReady("DispatcherDeploymentDoesNotExist", "Dispatcher Deployment does not exist")),
+				Object: reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithInitKafkaChannelConditions,
+					reconcilekafkatesting.WithKafkaChannelConfigReady(),
+					reconcilekafkatesting.WithKafkaChannelTopicReady(),
+					reconcilekafkatesting.WithKafkaChannelServiceReady(),
+					reconcilekafkatesting.WithKafkaChannelEndpointsNotReady("DispatcherEndpointsDoesNotExist", "Dispatcher Endpoints does not exist")),
 			}},
 			WantPatches: []clientgotesting.PatchActionImpl{
 				patchFinalizers(testNS, kcName),
 			},
 			WantEvents: []string{
-				Eventf(corev1.EventTypeWarning, channelReconcileFailed, "KafkaChannel reconciliation failed: deployment.apps \"test-deployment\" not found"),
+				finalizerUpdatedEvent,
+				Eventf(corev1.EventTypeNormal, dispatcherDeploymentCreated, "Dispatcher deployment created"),
+				Eventf(corev1.EventTypeNormal, dispatcherServiceCreated, "Dispatcher service created"),
+				Eventf(corev1.EventTypeWarning, "InternalError", `endpoints "kafka-ch-dispatcher" not found`),
 			},
 		}, {
-			Name: "Service does not exist",
+			Name: "Service does not exist, automatically created",
 			Key:  kcKey,
 			Objects: []runtime.Object{
 				makeReadyDeployment(),
-				reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithKafkaFinalizer(finalizerName)),
+				reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithKafkaFinalizer(finalizerName)),
 			},
 			WantErr: true,
+			WantCreates: []runtime.Object{
+				makeService(),
+			},
 			WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
-				Object: reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithInitKafkaChannelConditions,
-					reconciletesting.WithKafkaFinalizer(finalizerName),
-					reconciletesting.WithKafkaChannelTopicReady(),
-					reconciletesting.WithKafkaChannelDeploymentReady(),
-					reconciletesting.WithKafkaChannelServicetNotReady("DispatcherServiceDoesNotExist", "Dispatcher Service does not exist")),
+				Object: reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithInitKafkaChannelConditions,
+					reconcilekafkatesting.WithKafkaFinalizer(finalizerName),
+					reconcilekafkatesting.WithKafkaChannelConfigReady(),
+					reconcilekafkatesting.WithKafkaChannelTopicReady(),
+					reconcilekafkatesting.WithKafkaChannelDeploymentReady(),
+					reconcilekafkatesting.WithKafkaChannelServiceReady(),
+					reconcilekafkatesting.WithKafkaChannelEndpointsNotReady("DispatcherEndpointsDoesNotExist", "Dispatcher Endpoints does not exist")),
 			}},
 			WantEvents: []string{
-				Eventf(corev1.EventTypeWarning, channelReconcileFailed, "KafkaChannel reconciliation failed: service \"test-service\" not found"),
+				Eventf(corev1.EventTypeNormal, dispatcherServiceCreated, "Dispatcher service created"),
+				Eventf(corev1.EventTypeWarning, "InternalError", `endpoints "kafka-ch-dispatcher" not found`),
 			},
 		}, {
 			Name: "Endpoints does not exist",
@@ -181,22 +156,23 @@ func TestAllCases(t *testing.T) {
 			Objects: []runtime.Object{
 				makeReadyDeployment(),
 				makeService(),
-				reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithKafkaFinalizer(finalizerName)),
+				reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithKafkaFinalizer(finalizerName)),
 			},
 			WantErr: true,
 			WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
-				Object: reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithInitKafkaChannelConditions,
-					reconciletesting.WithKafkaFinalizer(finalizerName),
-					reconciletesting.WithKafkaChannelTopicReady(),
-					reconciletesting.WithKafkaChannelDeploymentReady(),
-					reconciletesting.WithKafkaChannelServiceReady(),
-					reconciletesting.WithKafkaChannelEndpointsNotReady("DispatcherEndpointsDoesNotExist", "Dispatcher Endpoints does not exist"),
+				Object: reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithInitKafkaChannelConditions,
+					reconcilekafkatesting.WithKafkaFinalizer(finalizerName),
+					reconcilekafkatesting.WithKafkaChannelConfigReady(),
+					reconcilekafkatesting.WithKafkaChannelTopicReady(),
+					reconcilekafkatesting.WithKafkaChannelDeploymentReady(),
+					reconcilekafkatesting.WithKafkaChannelServiceReady(),
+					reconcilekafkatesting.WithKafkaChannelEndpointsNotReady("DispatcherEndpointsDoesNotExist", "Dispatcher Endpoints does not exist"),
 				),
 			}},
 			WantEvents: []string{
-				Eventf(corev1.EventTypeWarning, channelReconcileFailed, "KafkaChannel reconciliation failed: endpoints \"test-service\" not found"),
+				Eventf(corev1.EventTypeWarning, "InternalError", `endpoints "kafka-ch-dispatcher" not found`),
 			},
 		}, {
 			Name: "Endpoints not ready",
@@ -205,22 +181,23 @@ func TestAllCases(t *testing.T) {
 				makeReadyDeployment(),
 				makeService(),
 				makeEmptyEndpoints(),
-				reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithKafkaFinalizer(finalizerName)),
+				reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithKafkaFinalizer(finalizerName)),
 			},
 			WantErr: true,
 			WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
-				Object: reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithInitKafkaChannelConditions,
-					reconciletesting.WithKafkaFinalizer(finalizerName),
-					reconciletesting.WithKafkaChannelTopicReady(),
-					reconciletesting.WithKafkaChannelDeploymentReady(),
-					reconciletesting.WithKafkaChannelServiceReady(),
-					reconciletesting.WithKafkaChannelEndpointsNotReady("DispatcherEndpointsNotReady", "There are no endpoints ready for Dispatcher service"),
+				Object: reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithInitKafkaChannelConditions,
+					reconcilekafkatesting.WithKafkaFinalizer(finalizerName),
+					reconcilekafkatesting.WithKafkaChannelConfigReady(),
+					reconcilekafkatesting.WithKafkaChannelTopicReady(),
+					reconcilekafkatesting.WithKafkaChannelDeploymentReady(),
+					reconcilekafkatesting.WithKafkaChannelServiceReady(),
+					reconcilekafkatesting.WithKafkaChannelEndpointsNotReady("DispatcherEndpointsNotReady", "There are no endpoints ready for Dispatcher service"),
 				),
 			}},
 			WantEvents: []string{
-				Eventf(corev1.EventTypeWarning, channelReconcileFailed, "KafkaChannel reconciliation failed: there are no endpoints ready for Dispatcher service test-service"),
+				Eventf(corev1.EventTypeWarning, "InternalError", `there are no endpoints ready for Dispatcher service kafka-ch-dispatcher`),
 			},
 		}, {
 			Name: "Works, creates new channel",
@@ -229,27 +206,28 @@ func TestAllCases(t *testing.T) {
 				makeReadyDeployment(),
 				makeService(),
 				makeReadyEndpoints(),
-				reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithKafkaFinalizer(finalizerName)),
+				reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithKafkaFinalizer(finalizerName)),
 			},
 			WantErr: false,
 			WantCreates: []runtime.Object{
-				makeChannelService(reconciletesting.NewKafkaChannel(kcName, testNS)),
+				makeChannelService(reconcilekafkatesting.NewKafkaChannel(kcName, testNS)),
 			},
 			WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
-				Object: reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithInitKafkaChannelConditions,
-					reconciletesting.WithKafkaFinalizer(finalizerName),
-					reconciletesting.WithKafkaChannelTopicReady(),
-					reconciletesting.WithKafkaChannelDeploymentReady(),
-					reconciletesting.WithKafkaChannelServiceReady(),
-					reconciletesting.WithKafkaChannelEndpointsReady(),
-					reconciletesting.WithKafkaChannelChannelServiceReady(),
-					reconciletesting.WithKafkaChannelAddress(channelServiceAddress),
+				Object: reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithInitKafkaChannelConditions,
+					reconcilekafkatesting.WithKafkaFinalizer(finalizerName),
+					reconcilekafkatesting.WithKafkaChannelConfigReady(),
+					reconcilekafkatesting.WithKafkaChannelTopicReady(),
+					reconcilekafkatesting.WithKafkaChannelDeploymentReady(),
+					reconcilekafkatesting.WithKafkaChannelServiceReady(),
+					reconcilekafkatesting.WithKafkaChannelEndpointsReady(),
+					reconcilekafkatesting.WithKafkaChannelChannelServiceReady(),
+					reconcilekafkatesting.WithKafkaChannelAddress(channelServiceAddress),
 				),
 			}},
 			WantEvents: []string{
-				Eventf(corev1.EventTypeNormal, channelReconciled, "KafkaChannel reconciled"),
+				Eventf(corev1.EventTypeNormal, "KafkaChannelReconciled", `KafkaChannel reconciled: "test-namespace/test-kc"`),
 			},
 		}, {
 			Name: "Works, channel exists",
@@ -258,25 +236,26 @@ func TestAllCases(t *testing.T) {
 				makeReadyDeployment(),
 				makeService(),
 				makeReadyEndpoints(),
-				reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithKafkaFinalizer(finalizerName)),
-				makeChannelService(reconciletesting.NewKafkaChannel(kcName, testNS)),
+				reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithKafkaFinalizer(finalizerName)),
+				makeChannelService(reconcilekafkatesting.NewKafkaChannel(kcName, testNS)),
 			},
 			WantErr: false,
 			WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
-				Object: reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithInitKafkaChannelConditions,
-					reconciletesting.WithKafkaFinalizer(finalizerName),
-					reconciletesting.WithKafkaChannelTopicReady(),
-					reconciletesting.WithKafkaChannelDeploymentReady(),
-					reconciletesting.WithKafkaChannelServiceReady(),
-					reconciletesting.WithKafkaChannelEndpointsReady(),
-					reconciletesting.WithKafkaChannelChannelServiceReady(),
-					reconciletesting.WithKafkaChannelAddress(channelServiceAddress),
+				Object: reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithInitKafkaChannelConditions,
+					reconcilekafkatesting.WithKafkaFinalizer(finalizerName),
+					reconcilekafkatesting.WithKafkaChannelConfigReady(),
+					reconcilekafkatesting.WithKafkaChannelTopicReady(),
+					reconcilekafkatesting.WithKafkaChannelDeploymentReady(),
+					reconcilekafkatesting.WithKafkaChannelServiceReady(),
+					reconcilekafkatesting.WithKafkaChannelEndpointsReady(),
+					reconcilekafkatesting.WithKafkaChannelChannelServiceReady(),
+					reconcilekafkatesting.WithKafkaChannelAddress(channelServiceAddress),
 				),
 			}},
 			WantEvents: []string{
-				Eventf(corev1.EventTypeNormal, channelReconciled, "KafkaChannel reconciled"),
+				Eventf(corev1.EventTypeNormal, "KafkaChannelReconciled", `KafkaChannel reconciled: "test-namespace/test-kc"`),
 			},
 		}, {
 			Name: "channel exists, not owned by us",
@@ -285,24 +264,25 @@ func TestAllCases(t *testing.T) {
 				makeReadyDeployment(),
 				makeService(),
 				makeReadyEndpoints(),
-				reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithKafkaFinalizer(finalizerName)),
-				makeChannelServiceNotOwnedByUs(reconciletesting.NewKafkaChannel(kcName, testNS)),
+				reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithKafkaFinalizer(finalizerName)),
+				makeChannelServiceNotOwnedByUs(),
 			},
 			WantErr: true,
 			WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
-				Object: reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithInitKafkaChannelConditions,
-					reconciletesting.WithKafkaFinalizer(finalizerName),
-					reconciletesting.WithKafkaChannelTopicReady(),
-					reconciletesting.WithKafkaChannelDeploymentReady(),
-					reconciletesting.WithKafkaChannelServiceReady(),
-					reconciletesting.WithKafkaChannelEndpointsReady(),
-					reconciletesting.WithKafkaChannelChannelServicetNotReady("ChannelServiceFailed", "Channel Service failed: kafkachannel: test-namespace/test-kc does not own Service: \"test-kc-kn-channel\""),
+				Object: reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithInitKafkaChannelConditions,
+					reconcilekafkatesting.WithKafkaFinalizer(finalizerName),
+					reconcilekafkatesting.WithKafkaChannelConfigReady(),
+					reconcilekafkatesting.WithKafkaChannelTopicReady(),
+					reconcilekafkatesting.WithKafkaChannelDeploymentReady(),
+					reconcilekafkatesting.WithKafkaChannelServiceReady(),
+					reconcilekafkatesting.WithKafkaChannelEndpointsReady(),
+					reconcilekafkatesting.WithKafkaChannelChannelServicetNotReady("ChannelServiceFailed", "Channel Service failed: kafkachannel: test-namespace/test-kc does not own Service: \"test-kc-kn-channel\""),
 				),
 			}},
 			WantEvents: []string{
-				Eventf(corev1.EventTypeWarning, channelReconcileFailed, "KafkaChannel reconciliation failed: kafkachannel: test-namespace/test-kc does not own Service: \"test-kc-kn-channel\""),
+				Eventf(corev1.EventTypeWarning, "InternalError", `kafkachannel: test-namespace/test-kc does not own Service: "test-kc-kn-channel"`),
 			},
 		}, {
 			Name: "channel does not exist, fails to create",
@@ -311,41 +291,41 @@ func TestAllCases(t *testing.T) {
 				makeReadyDeployment(),
 				makeService(),
 				makeReadyEndpoints(),
-				reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithKafkaFinalizer(finalizerName)),
+				reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithKafkaFinalizer(finalizerName)),
 			},
 			WantErr: true,
 			WithReactors: []clientgotesting.ReactionFunc{
 				InduceFailure("create", "Services"),
 			},
 			WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
-				Object: reconciletesting.NewKafkaChannel(kcName, testNS,
-					reconciletesting.WithInitKafkaChannelConditions,
-					reconciletesting.WithKafkaFinalizer(finalizerName),
-					reconciletesting.WithKafkaChannelTopicReady(),
-					reconciletesting.WithKafkaChannelDeploymentReady(),
-					reconciletesting.WithKafkaChannelServiceReady(),
-					reconciletesting.WithKafkaChannelEndpointsReady(),
-					reconciletesting.WithKafkaChannelChannelServicetNotReady("ChannelServiceFailed", "Channel Service failed: inducing failure for create services"),
+				Object: reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+					reconcilekafkatesting.WithInitKafkaChannelConditions,
+					reconcilekafkatesting.WithKafkaFinalizer(finalizerName),
+					reconcilekafkatesting.WithKafkaChannelConfigReady(),
+					reconcilekafkatesting.WithKafkaChannelTopicReady(),
+					reconcilekafkatesting.WithKafkaChannelDeploymentReady(),
+					reconcilekafkatesting.WithKafkaChannelServiceReady(),
+					reconcilekafkatesting.WithKafkaChannelEndpointsReady(),
+					reconcilekafkatesting.WithKafkaChannelChannelServicetNotReady("ChannelServiceFailed", "Channel Service failed: inducing failure for create services"),
 				),
 			}},
 			WantCreates: []runtime.Object{
-				makeChannelService(reconciletesting.NewKafkaChannel(kcName, testNS)),
+				makeChannelService(reconcilekafkatesting.NewKafkaChannel(kcName, testNS)),
 			},
 			WantEvents: []string{
-				Eventf(corev1.EventTypeWarning, channelReconcileFailed, "KafkaChannel reconciliation failed: inducing failure for create services"),
+				Eventf(corev1.EventTypeWarning, "InternalError", "inducing failure for create services"),
 			},
 			// TODO add UTs for topic creation and deletion.
 		},
 	}
 	defer logtesting.ClearAll()
 
-	table.Test(t, reconciletesting.MakeFactory(func(listers *reconciletesting.Listers, opt reconciler.Options) controller.Reconciler {
-		return &Reconciler{
-			Base:                     reconciler.NewBase(opt, controllerAgentName),
-			dispatcherNamespace:      testNS,
-			dispatcherDeploymentName: dispatcherDeploymentName,
-			dispatcherServiceName:    dispatcherServiceName,
+	table.Test(t, reconcilertesting.MakeFactory(func(ctx context.Context, listers *reconcilekafkatesting.Listers, cmw configmap.Watcher) controller.Reconciler {
+
+		r := &Reconciler{
+			systemNamespace: testNS,
+			dispatcherImage: testDispatcherImage,
 			kafkaConfig: &KafkaConfig{
 				Brokers: []string{brokerName},
 			},
@@ -356,13 +336,165 @@ func TestAllCases(t *testing.T) {
 			serviceLister:        listers.GetServiceLister(),
 			endpointsLister:      listers.GetEndpointsLister(),
 			kafkaClusterAdmin:    &mockClusterAdmin{},
+			kafkaClientSet:       fakekafkaclient.Get(ctx),
+			KubeClientSet:        kubeclient.Get(ctx),
+			EventingClientSet:    eventingClient.Get(ctx),
 		}
-	}))
+		return kafkachannel.NewReconciler(ctx, logging.FromContext(ctx), r.kafkaClientSet, listers.GetKafkaChannelLister(), controller.GetEventRecorder(ctx), r)
+	}, zap.L()))
+}
+
+func TestTopicExists(t *testing.T) {
+	kcKey := testNS + "/" + kcName
+	row := TableRow{
+		Name: "Works, topic already exists",
+		Key:  kcKey,
+		Objects: []runtime.Object{
+			makeReadyDeployment(),
+			makeService(),
+			makeReadyEndpoints(),
+			reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+				reconcilekafkatesting.WithKafkaFinalizer(finalizerName)),
+		},
+		WantErr: false,
+		WantCreates: []runtime.Object{
+			makeChannelService(reconcilekafkatesting.NewKafkaChannel(kcName, testNS)),
+		},
+		WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
+			Object: reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+				reconcilekafkatesting.WithInitKafkaChannelConditions,
+				reconcilekafkatesting.WithKafkaFinalizer(finalizerName),
+				reconcilekafkatesting.WithKafkaChannelConfigReady(),
+				reconcilekafkatesting.WithKafkaChannelTopicReady(),
+				reconcilekafkatesting.WithKafkaChannelDeploymentReady(),
+				reconcilekafkatesting.WithKafkaChannelServiceReady(),
+				reconcilekafkatesting.WithKafkaChannelEndpointsReady(),
+				reconcilekafkatesting.WithKafkaChannelChannelServiceReady(),
+				reconcilekafkatesting.WithKafkaChannelAddress(channelServiceAddress),
+			),
+		}},
+		WantEvents: []string{
+			Eventf(corev1.EventTypeNormal, "KafkaChannelReconciled", `KafkaChannel reconciled: "test-namespace/test-kc"`),
+		},
+	}
+	defer logtesting.ClearAll()
+
+	row.Test(t, reconcilertesting.MakeFactory(func(ctx context.Context, listers *reconcilekafkatesting.Listers, cmw configmap.Watcher) controller.Reconciler {
+
+		r := &Reconciler{
+			systemNamespace: testNS,
+			dispatcherImage: testDispatcherImage,
+			kafkaConfig: &KafkaConfig{
+				Brokers: []string{brokerName},
+			},
+			kafkachannelLister: listers.GetKafkaChannelLister(),
+			// TODO fix
+			kafkachannelInformer: nil,
+			deploymentLister:     listers.GetDeploymentLister(),
+			serviceLister:        listers.GetServiceLister(),
+			endpointsLister:      listers.GetEndpointsLister(),
+			kafkaClusterAdmin: &mockClusterAdmin{
+				mockCreateTopicFunc: func(topic string, detail *sarama.TopicDetail, validateOnly bool) error {
+					errMsg := sarama.ErrTopicAlreadyExists.Error()
+					return &sarama.TopicError{
+						Err:    sarama.ErrTopicAlreadyExists,
+						ErrMsg: &errMsg,
+					}
+				},
+			},
+			kafkaClientSet:    fakekafkaclient.Get(ctx),
+			KubeClientSet:     kubeclient.Get(ctx),
+			EventingClientSet: eventingClient.Get(ctx),
+		}
+		return kafkachannel.NewReconciler(ctx, logging.FromContext(ctx), r.kafkaClientSet, listers.GetKafkaChannelLister(), controller.GetEventRecorder(ctx), r)
+	}, zap.L()))
+}
+
+func TestDeploymentUpdatedOnImageChange(t *testing.T) {
+	kcKey := testNS + "/" + kcName
+	row := TableRow{
+		Name: "Works, topic already exists",
+		Key:  kcKey,
+		Objects: []runtime.Object{
+			makeDeploymentWithImage("differentimage"),
+			makeService(),
+			makeReadyEndpoints(),
+			reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+				reconcilekafkatesting.WithKafkaFinalizer(finalizerName)),
+		},
+		WantErr: false,
+		WantCreates: []runtime.Object{
+			makeChannelService(reconcilekafkatesting.NewKafkaChannel(kcName, testNS)),
+		},
+		WantUpdates: []clientgotesting.UpdateActionImpl{{
+			Object: makeDeployment(),
+		}},
+		WantStatusUpdates: []clientgotesting.UpdateActionImpl{{
+			Object: reconcilekafkatesting.NewKafkaChannel(kcName, testNS,
+				reconcilekafkatesting.WithInitKafkaChannelConditions,
+				reconcilekafkatesting.WithKafkaFinalizer(finalizerName),
+				reconcilekafkatesting.WithKafkaChannelConfigReady(),
+				reconcilekafkatesting.WithKafkaChannelTopicReady(),
+				//				reconcilekafkatesting.WithKafkaChannelDeploymentReady(),
+				reconcilekafkatesting.WithKafkaChannelServiceReady(),
+				reconcilekafkatesting.WithKafkaChannelEndpointsReady(),
+				reconcilekafkatesting.WithKafkaChannelChannelServiceReady(),
+				reconcilekafkatesting.WithKafkaChannelAddress(channelServiceAddress),
+			),
+		}},
+		WantEvents: []string{
+			Eventf(corev1.EventTypeNormal, dispatcherDeploymentUpdated, "Dispatcher deployment updated"),
+			Eventf(corev1.EventTypeNormal, "KafkaChannelReconciled", `KafkaChannel reconciled: "test-namespace/test-kc"`),
+		},
+	}
+	defer logtesting.ClearAll()
+
+	row.Test(t, reconcilertesting.MakeFactory(func(ctx context.Context, listers *reconcilekafkatesting.Listers, cmw configmap.Watcher) controller.Reconciler {
+
+		r := &Reconciler{
+			systemNamespace: testNS,
+			dispatcherImage: testDispatcherImage,
+			kafkaConfig: &KafkaConfig{
+				Brokers: []string{brokerName},
+			},
+			kafkachannelLister: listers.GetKafkaChannelLister(),
+			// TODO fix
+			kafkachannelInformer: nil,
+			deploymentLister:     listers.GetDeploymentLister(),
+			serviceLister:        listers.GetServiceLister(),
+			endpointsLister:      listers.GetEndpointsLister(),
+			kafkaClusterAdmin: &mockClusterAdmin{
+				mockCreateTopicFunc: func(topic string, detail *sarama.TopicDetail, validateOnly bool) error {
+					errMsg := sarama.ErrTopicAlreadyExists.Error()
+					return &sarama.TopicError{
+						Err:    sarama.ErrTopicAlreadyExists,
+						ErrMsg: &errMsg,
+					}
+				},
+			},
+			kafkaClientSet:    fakekafkaclient.Get(ctx),
+			KubeClientSet:     kubeclient.Get(ctx),
+			EventingClientSet: eventingClient.Get(ctx),
+		}
+		return kafkachannel.NewReconciler(ctx, logging.FromContext(ctx), r.kafkaClientSet, listers.GetKafkaChannelLister(), controller.GetEventRecorder(ctx), r)
+	}, zap.L()))
 }
 
 type mockClusterAdmin struct {
 	mockCreateTopicFunc func(topic string, detail *sarama.TopicDetail, validateOnly bool) error
 	mockDeleteTopicFunc func(topic string) error
+}
+
+func (ca *mockClusterAdmin) AlterPartitionReassignments(topic string, assignment [][]int32) error {
+	return nil
+}
+
+func (ca *mockClusterAdmin) ListPartitionReassignments(topics string, partitions []int32) (topicStatus map[string]map[int32]*sarama.PartitionReplicaReassignmentsStatus, err error) {
+	return nil, nil
+}
+
+func (ca *mockClusterAdmin) DescribeLogDirs(brokers []int32) (map[int32][]sarama.DescribeLogDirsResponseDirMetadata, error) {
+	return nil, nil
 }
 
 func (ca *mockClusterAdmin) CreateTopic(topic string, detail *sarama.TopicDetail, validateOnly bool) error {
@@ -435,18 +567,22 @@ func (ca *mockClusterAdmin) DescribeCluster() (brokers []*sarama.Broker, control
 	return nil, 0, nil
 }
 
+// Delete a consumer group.
+func (ca *mockClusterAdmin) DeleteConsumerGroup(group string) error {
+	return nil
+}
+
+var _ sarama.ClusterAdmin = (*mockClusterAdmin)(nil)
+
+func makeDeploymentWithImage(image string) *appsv1.Deployment {
+	return resources.MakeDispatcher(resources.DispatcherArgs{
+		DispatcherNamespace: testNS,
+		Image:               image,
+	})
+}
+
 func makeDeployment() *appsv1.Deployment {
-	return &appsv1.Deployment{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "apps/v1",
-			Kind:       "Deployment",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: testNS,
-			Name:      dispatcherDeploymentName,
-		},
-		Status: appsv1.DeploymentStatus{},
-	}
+	return makeDeploymentWithImage(testDispatcherImage)
 }
 
 func makeReadyDeployment() *appsv1.Deployment {
@@ -456,16 +592,7 @@ func makeReadyDeployment() *appsv1.Deployment {
 }
 
 func makeService() *corev1.Service {
-	return &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "v1",
-			Kind:       "Service",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: testNS,
-			Name:      dispatcherServiceName,
-		},
-	}
+	return resources.MakeDispatcherService(testNS)
 }
 
 func makeChannelService(nc *v1alpha1.KafkaChannel) *corev1.Service {
@@ -486,12 +613,12 @@ func makeChannelService(nc *v1alpha1.KafkaChannel) *corev1.Service {
 		},
 		Spec: corev1.ServiceSpec{
 			Type:         corev1.ServiceTypeExternalName,
-			ExternalName: fmt.Sprintf("%s.%s.svc.%s", dispatcherServiceName, testNS, utils.GetClusterDomainName()),
+			ExternalName: fmt.Sprintf("%s.%s.svc.%s", dispatcherName, testNS, utils.GetClusterDomainName()),
 		},
 	}
 }
 
-func makeChannelServiceNotOwnedByUs(nc *v1alpha1.KafkaChannel) *corev1.Service {
+func makeChannelServiceNotOwnedByUs() *corev1.Service {
 	return &corev1.Service{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -506,7 +633,7 @@ func makeChannelServiceNotOwnedByUs(nc *v1alpha1.KafkaChannel) *corev1.Service {
 		},
 		Spec: corev1.ServiceSpec{
 			Type:         corev1.ServiceTypeExternalName,
-			ExternalName: fmt.Sprintf("%s.%s.svc.%s", dispatcherServiceName, testNS, utils.GetClusterDomainName()),
+			ExternalName: fmt.Sprintf("%s.%s.svc.%s", dispatcherName, testNS, utils.GetClusterDomainName()),
 		},
 	}
 }
@@ -519,7 +646,7 @@ func makeEmptyEndpoints() *corev1.Endpoints {
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: testNS,
-			Name:      dispatcherServiceName,
+			Name:      dispatcherName,
 		},
 	}
 }

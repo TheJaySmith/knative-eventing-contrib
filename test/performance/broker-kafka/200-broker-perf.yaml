@@ -32,13 +32,12 @@ spec:
       restartPolicy: Never
       containers:
       - name: sender-receiver
-        image: knative.dev/eventing/test/test_images/performance
+        image: ko://knative.dev/eventing/test/test_images/performance
         args:
-        - "--role=sender-receiver"
+        - "--roles=sender,receiver"
         - "--sink=http://kafka-test-broker-broker.perf-eventing.svc.cluster.local"
         - "--aggregator=broker-perf-aggregator:10000"
         - "--pace=500:30,600:30,700:30,800:30,900:30,1000:30"
-        - "--verbose"
         env:
         - name: GOGC
           value: "off"
@@ -72,12 +71,11 @@ spec:
   restartPolicy: Never
   containers:
   - name: aggregator
-    image: knative.dev/eventing/test/test_images/performance
+    image: ko://knative.dev/eventing/test/test_images/performance
     args:
-    - "--role=aggregator"
-      # set to the number of sender-receiver
-    - "--expect-records=1"
-    - "--verbose"
+    - "--roles=aggregator"
+      # set to the number of senders + number of receivers
+    - "--expect-records=2"
     ports:
     - name: grpc
       containerPort: 10000
@@ -90,7 +88,7 @@ spec:
       mountPath: /etc/config-mako
     terminationMessagePolicy: FallbackToLogsOnError
   - name: mako-stub
-    image: knative.dev/pkg/test/mako/stub-sidecar
+    image: ko://knative.dev/pkg/test/mako/stub-sidecar
     ports:
     - name: quickstore
       containerPort: 9813

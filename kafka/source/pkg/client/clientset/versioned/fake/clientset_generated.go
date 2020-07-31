@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,8 +25,14 @@ import (
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	"k8s.io/client-go/testing"
 	clientset "knative.dev/eventing-contrib/kafka/source/pkg/client/clientset/versioned"
+	bindingsv1alpha1 "knative.dev/eventing-contrib/kafka/source/pkg/client/clientset/versioned/typed/bindings/v1alpha1"
+	fakebindingsv1alpha1 "knative.dev/eventing-contrib/kafka/source/pkg/client/clientset/versioned/typed/bindings/v1alpha1/fake"
+	bindingsv1beta1 "knative.dev/eventing-contrib/kafka/source/pkg/client/clientset/versioned/typed/bindings/v1beta1"
+	fakebindingsv1beta1 "knative.dev/eventing-contrib/kafka/source/pkg/client/clientset/versioned/typed/bindings/v1beta1/fake"
 	sourcesv1alpha1 "knative.dev/eventing-contrib/kafka/source/pkg/client/clientset/versioned/typed/sources/v1alpha1"
 	fakesourcesv1alpha1 "knative.dev/eventing-contrib/kafka/source/pkg/client/clientset/versioned/typed/sources/v1alpha1/fake"
+	sourcesv1beta1 "knative.dev/eventing-contrib/kafka/source/pkg/client/clientset/versioned/typed/sources/v1beta1"
+	fakesourcesv1beta1 "knative.dev/eventing-contrib/kafka/source/pkg/client/clientset/versioned/typed/sources/v1beta1/fake"
 )
 
 // NewSimpleClientset returns a clientset that will respond with the provided objects.
@@ -41,7 +47,7 @@ func NewSimpleClientset(objects ...runtime.Object) *Clientset {
 		}
 	}
 
-	cs := &Clientset{}
+	cs := &Clientset{tracker: o}
 	cs.discovery = &fakediscovery.FakeDiscovery{Fake: &cs.Fake}
 	cs.AddReactor("*", "*", testing.ObjectReaction(o))
 	cs.AddWatchReactor("*", func(action testing.Action) (handled bool, ret watch.Interface, err error) {
@@ -63,20 +69,35 @@ func NewSimpleClientset(objects ...runtime.Object) *Clientset {
 type Clientset struct {
 	testing.Fake
 	discovery *fakediscovery.FakeDiscovery
+	tracker   testing.ObjectTracker
 }
 
 func (c *Clientset) Discovery() discovery.DiscoveryInterface {
 	return c.discovery
 }
 
+func (c *Clientset) Tracker() testing.ObjectTracker {
+	return c.tracker
+}
+
 var _ clientset.Interface = &Clientset{}
+
+// BindingsV1alpha1 retrieves the BindingsV1alpha1Client
+func (c *Clientset) BindingsV1alpha1() bindingsv1alpha1.BindingsV1alpha1Interface {
+	return &fakebindingsv1alpha1.FakeBindingsV1alpha1{Fake: &c.Fake}
+}
+
+// BindingsV1beta1 retrieves the BindingsV1beta1Client
+func (c *Clientset) BindingsV1beta1() bindingsv1beta1.BindingsV1beta1Interface {
+	return &fakebindingsv1beta1.FakeBindingsV1beta1{Fake: &c.Fake}
+}
 
 // SourcesV1alpha1 retrieves the SourcesV1alpha1Client
 func (c *Clientset) SourcesV1alpha1() sourcesv1alpha1.SourcesV1alpha1Interface {
 	return &fakesourcesv1alpha1.FakeSourcesV1alpha1{Fake: &c.Fake}
 }
 
-// Sources retrieves the SourcesV1alpha1Client
-func (c *Clientset) Sources() sourcesv1alpha1.SourcesV1alpha1Interface {
-	return &fakesourcesv1alpha1.FakeSourcesV1alpha1{Fake: &c.Fake}
+// SourcesV1beta1 retrieves the SourcesV1beta1Client
+func (c *Clientset) SourcesV1beta1() sourcesv1beta1.SourcesV1beta1Interface {
+	return &fakesourcesv1beta1.FakeSourcesV1beta1{Fake: &c.Fake}
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,6 +27,8 @@ import (
 	clientset "knative.dev/eventing-contrib/kafka/channel/pkg/client/clientset/versioned"
 	messagingv1alpha1 "knative.dev/eventing-contrib/kafka/channel/pkg/client/clientset/versioned/typed/messaging/v1alpha1"
 	fakemessagingv1alpha1 "knative.dev/eventing-contrib/kafka/channel/pkg/client/clientset/versioned/typed/messaging/v1alpha1/fake"
+	messagingv1beta1 "knative.dev/eventing-contrib/kafka/channel/pkg/client/clientset/versioned/typed/messaging/v1beta1"
+	fakemessagingv1beta1 "knative.dev/eventing-contrib/kafka/channel/pkg/client/clientset/versioned/typed/messaging/v1beta1/fake"
 )
 
 // NewSimpleClientset returns a clientset that will respond with the provided objects.
@@ -41,7 +43,7 @@ func NewSimpleClientset(objects ...runtime.Object) *Clientset {
 		}
 	}
 
-	cs := &Clientset{}
+	cs := &Clientset{tracker: o}
 	cs.discovery = &fakediscovery.FakeDiscovery{Fake: &cs.Fake}
 	cs.AddReactor("*", "*", testing.ObjectReaction(o))
 	cs.AddWatchReactor("*", func(action testing.Action) (handled bool, ret watch.Interface, err error) {
@@ -63,10 +65,15 @@ func NewSimpleClientset(objects ...runtime.Object) *Clientset {
 type Clientset struct {
 	testing.Fake
 	discovery *fakediscovery.FakeDiscovery
+	tracker   testing.ObjectTracker
 }
 
 func (c *Clientset) Discovery() discovery.DiscoveryInterface {
 	return c.discovery
+}
+
+func (c *Clientset) Tracker() testing.ObjectTracker {
+	return c.tracker
 }
 
 var _ clientset.Interface = &Clientset{}
@@ -76,7 +83,7 @@ func (c *Clientset) MessagingV1alpha1() messagingv1alpha1.MessagingV1alpha1Inter
 	return &fakemessagingv1alpha1.FakeMessagingV1alpha1{Fake: &c.Fake}
 }
 
-// Messaging retrieves the MessagingV1alpha1Client
-func (c *Clientset) Messaging() messagingv1alpha1.MessagingV1alpha1Interface {
-	return &fakemessagingv1alpha1.FakeMessagingV1alpha1{Fake: &c.Fake}
+// MessagingV1beta1 retrieves the MessagingV1beta1Client
+func (c *Clientset) MessagingV1beta1() messagingv1beta1.MessagingV1beta1Interface {
+	return &fakemessagingv1beta1.FakeMessagingV1beta1{Fake: &c.Fake}
 }

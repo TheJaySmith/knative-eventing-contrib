@@ -21,15 +21,19 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"knative.dev/pkg/webhook"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"knative.dev/pkg/webhook/resourcesemantics"
 
 	eventingduck "knative.dev/eventing/pkg/apis/duck/v1alpha1"
+	"knative.dev/eventing/pkg/apis/eventing"
 	"knative.dev/pkg/apis"
 )
 
 func TestKafkaChannelValidation(t *testing.T) {
+	aURL, _ := apis.ParseURL("http://example.com/")
+
 	testCases := map[string]struct {
-		cr   webhook.GenericCRD
+		cr   resourcesemantics.GenericCRD
 		want *apis.FieldError
 	}{
 		"empty spec": {
@@ -76,8 +80,8 @@ func TestKafkaChannelValidation(t *testing.T) {
 					ReplicationFactor: 1,
 					Subscribable: &eventingduck.Subscribable{
 						Subscribers: []eventingduck.SubscriberSpec{{
-							SubscriberURI: "subscriberendpoint",
-							ReplyURI:      "resultendpoint",
+							SubscriberURI: aURL,
+							ReplyURI:      aURL,
 						}},
 					}},
 			},
@@ -90,8 +94,8 @@ func TestKafkaChannelValidation(t *testing.T) {
 					ReplicationFactor: 1,
 					Subscribable: &eventingduck.Subscribable{
 						Subscribers: []eventingduck.SubscriberSpec{{
-							SubscriberURI: "subscriberendpoint",
-							ReplyURI:      "replyendpoint",
+							SubscriberURI: aURL,
+							ReplyURI:      aURL,
 						}, {}},
 					}},
 			},
@@ -120,6 +124,24 @@ func TestKafkaChannelValidation(t *testing.T) {
 				fe.Details = "expected at least one of, got none"
 				errs = errs.Also(fe)
 				return errs
+			}(),
+		},
+		"invalid scope annotation": {
+			cr: &KafkaChannel{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						eventing.ScopeAnnotationKey: "notvalid",
+					},
+				},
+				Spec: KafkaChannelSpec{
+					NumPartitions:     1,
+					ReplicationFactor: 1,
+				},
+			},
+			want: func() *apis.FieldError {
+				fe := apis.ErrInvalidValue("notvalid", "metadata.annotations.[eventing.knative.dev/scope]")
+				fe.Details = "expected either 'cluster' or 'namespace'"
+				return fe
 			}(),
 		},
 	}

@@ -64,7 +64,7 @@ with `test/e2e-tests.sh --run-tests --skip-knative-setup`.
 You can also use `go test` command to run unit tests:
 
 ```shell
-go test -v ./pkg/...
+go test -v ./...
 ```
 
 _By default `go test` will not run [the e2e tests](#running-end-to-end-tests),
@@ -160,6 +160,9 @@ a new sub-folder and include a Go file that will be an entry point to the
 application. This Go file should use the package `main` and include the function
 `main()`. It is a good practice to include a `readme` file as well. When
 uploading test images, `ko` will build an image from this folder.
+
+If you need to add a new test image imported from eventing, import it in
+`hack/tools.go`
 
 ## Flags
 

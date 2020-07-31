@@ -24,19 +24,20 @@ import (
 	appsv1listers "k8s.io/client-go/listers/apps/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+	fakeeventingclientset "knative.dev/eventing/pkg/client/clientset/versioned/fake"
+	fakeeventsclientset "knative.dev/eventing/pkg/client/clientset/versioned/fake"
+	"knative.dev/pkg/reconciler/testing"
+
 	messagingv1alpha1 "knative.dev/eventing-contrib/kafka/channel/pkg/apis/messaging/v1alpha1"
 	fakemessagingclientset "knative.dev/eventing-contrib/kafka/channel/pkg/client/clientset/versioned/fake"
 	messaginglisters "knative.dev/eventing-contrib/kafka/channel/pkg/client/listers/messaging/v1alpha1"
-	fakeeventsclientset "knative.dev/eventing/pkg/client/clientset/versioned/fake"
-	fakesharedclientset "knative.dev/pkg/client/clientset/versioned/fake"
-	"knative.dev/pkg/reconciler/testing"
 )
 
 var clientSetSchemes = []func(*runtime.Scheme) error{
 	fakekubeclientset.AddToScheme,
-	fakesharedclientset.AddToScheme,
 	fakeeventsclientset.AddToScheme,
 	fakemessagingclientset.AddToScheme,
+	fakeeventingclientset.AddToScheme,
 }
 
 type Listers struct {
@@ -44,6 +45,7 @@ type Listers struct {
 }
 
 func NewListers(objs []runtime.Object) Listers {
+
 	scheme := runtime.NewScheme()
 
 	for _, addTo := range clientSetSchemes {
@@ -67,6 +69,10 @@ func (l *Listers) GetKubeObjects() []runtime.Object {
 	return l.sorter.ObjectsForSchemeFunc(fakekubeclientset.AddToScheme)
 }
 
+func (l *Listers) GetEventingObjects() []runtime.Object {
+	return l.sorter.ObjectsForSchemeFunc(fakeeventingclientset.AddToScheme)
+}
+
 func (l *Listers) GetEventsObjects() []runtime.Object {
 	return l.sorter.ObjectsForSchemeFunc(fakeeventsclientset.AddToScheme)
 }
@@ -80,10 +86,6 @@ func (l *Listers) GetAllObjects() []runtime.Object {
 	all = append(all, l.GetEventsObjects()...)
 	all = append(all, l.GetKubeObjects()...)
 	return all
-}
-
-func (l *Listers) GetSharedObjects() []runtime.Object {
-	return l.sorter.ObjectsForSchemeFunc(fakesharedclientset.AddToScheme)
 }
 
 func (l *Listers) GetServiceLister() corev1listers.ServiceLister {

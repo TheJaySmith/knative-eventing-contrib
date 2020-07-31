@@ -20,29 +20,27 @@ package spoof
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"knative.dev/pkg/test/ingress"
 	"knative.dev/pkg/test/logging"
 	"knative.dev/pkg/test/zipkin"
+	"knative.dev/pkg/tracing/propagation/tracecontextb3"
 
 	"go.opencensus.io/plugin/ochttp"
-	"go.opencensus.io/plugin/ochttp/propagation/b3"
 	"go.opencensus.io/trace"
 )
 
 const (
-	requestInterval = 1 * time.Second
-	// RequestTimeout is the default timeout for the polling requests.
-	RequestTimeout = 5 * time.Minute
 	// Name of the temporary HTTP header that is added to http.Request to indicate that
 	// it is a SpoofClient.Poll request. This header is removed before making call to backend.
 	pollReqHeader = "X-Kn-Poll-Request-Do-Not-Trace"
@@ -65,7 +63,7 @@ func (r *Response) String() string {
 // Interface defines the actions that can be performed by the spoofing client.
 type Interface interface {
 	Do(*http.Request) (*Response, error)
-	Poll(*http.Request, ResponseChecker) (*Response, error)
+	Poll(*http.Request, ResponseChecker, ...ErrorRetryChecker) (*Response, error)
 }
 
 // https://medium.com/stupid-gopher-tricks/ensuring-go-interface-satisfaction-at-compile-time-1ed158e8fa17
@@ -81,14 +79,17 @@ var (
 // https://github.com/kubernetes/apimachinery/blob/cf7ae2f57dabc02a3d215f15ca61ae1446f3be8f/pkg/util/wait/wait.go#L172
 type ResponseChecker func(resp *Response) (done bool, err error)
 
+// ErrorRetryChecker is used to determine if an error should be retried or not.
+// If an error should be retried, it should return true and the wrapped error to explain why to retry.
+type ErrorRetryChecker func(e error) (retry bool, err error)
+
 // SpoofingClient is a minimal HTTP client wrapper that spoofs the domain of requests
 // for non-resolvable domains.
 type SpoofingClient struct {
 	Client          *http.Client
 	RequestInterval time.Duration
 	RequestTimeout  time.Duration
-
-	logf logging.FormatLogger
+	Logf            logging.FormatLogger
 }
 
 // TransportOption allows callers to customize the http.Transport used by a SpoofingClient
@@ -105,13 +106,16 @@ func New(
 	domain string,
 	resolvable bool,
 	endpointOverride string,
+	requestInterval time.Duration,
+	requestTimeout time.Duration,
 	opts ...TransportOption) (*SpoofingClient, error) {
 	endpoint, err := ResolveEndpoint(kubeClientset, domain, resolvable, endpointOverride)
 	if err != nil {
-		fmt.Errorf("failed get the cluster endpoint: %v", err)
+		return nil, fmt.Errorf("failed get the cluster endpoint: %w", err)
 	}
 
 	// Spoof the hostname at the resolver level
+	logf("Spoofing %s -> %s", domain, endpoint)
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (conn net.Conn, e error) {
 			spoofed := addr
@@ -119,7 +123,6 @@ func New(
 				// The original hostname:port is spoofed by replacing the hostname by the value
 				// returned by ResolveEndpoint.
 				spoofed = endpoint + ":" + addr[i+1:]
-				logf("Spoofing %s -> %s", addr, spoofed)
 			}
 			return dialContext(ctx, network, spoofed)
 		},
@@ -132,14 +135,14 @@ func New(
 	// Enable Zipkin tracing
 	roundTripper := &ochttp.Transport{
 		Base:        transport,
-		Propagation: &b3.HTTPFormat{},
+		Propagation: tracecontextb3.TraceContextB3Egress,
 	}
 
 	sc := SpoofingClient{
 		Client:          &http.Client{Transport: roundTripper},
 		RequestInterval: requestInterval,
-		RequestTimeout:  RequestTimeout,
-		logf:            logf,
+		RequestTimeout:  requestTimeout,
+		Logf:            logf,
 	}
 	return &sc, nil
 }
@@ -201,7 +204,7 @@ func (sc *SpoofingClient) Do(req *http.Request) (*Response, error) {
 }
 
 // Poll executes an http request until it satisfies the inState condition or encounters an error.
-func (sc *SpoofingClient) Poll(req *http.Request, inState ResponseChecker) (*Response, error) {
+func (sc *SpoofingClient) Poll(req *http.Request, inState ResponseChecker, errorRetryCheckers ...ErrorRetryChecker) (*Response, error) {
 	var (
 		resp *Response
 		err  error
@@ -214,19 +217,15 @@ func (sc *SpoofingClient) Poll(req *http.Request, inState ResponseChecker) (*Res
 		req.Header.Add(pollReqHeader, "True")
 		resp, err = sc.Do(req)
 		if err != nil {
-			if isTCPTimeout(err) {
-				sc.logf("Retrying %s for TCP timeout %v", req.URL.String(), err)
-				return false, nil
+			if len(errorRetryCheckers) == 0 {
+				errorRetryCheckers = []ErrorRetryChecker{DefaultErrorRetryChecker}
 			}
-			// Retrying on DNS error, since we may be using xip.io or nip.io in tests.
-			if isDNSError(err) {
-				sc.logf("Retrying %s for DNS error %v", req.URL.String(), err)
-				return false, nil
-			}
-			// Repeat the poll on `connection refused` errors, which are usually transient Istio errors.
-			if isTCPConnectRefuse(err) {
-				sc.logf("Retrying %s for connection refused %v", req.URL.String(), err)
-				return false, nil
+			for _, checker := range errorRetryCheckers {
+				retry, newErr := checker(err)
+				if retry {
+					sc.Logf("Retrying %s: %v", req.URL.String(), newErr)
+					return false, nil
+				}
 			}
 			return true, err
 		}
@@ -239,9 +238,32 @@ func (sc *SpoofingClient) Poll(req *http.Request, inState ResponseChecker) (*Res
 	}
 
 	if err != nil {
-		return resp, errors.Wrapf(err, "response: %s did not pass checks", resp)
+		return resp, fmt.Errorf("response: %s did not pass checks: %w", resp, err)
 	}
 	return resp, nil
+}
+
+// DefaultErrorRetryChecker implements the defaults for retrying on error.
+func DefaultErrorRetryChecker(err error) (bool, error) {
+	if isTCPTimeout(err) {
+		return true, fmt.Errorf("retrying for TCP timeout: %w", err)
+	}
+	// Retrying on DNS error, since we may be using xip.io or nip.io in tests.
+	if isDNSError(err) {
+		return true, fmt.Errorf("retrying for DNS error: %w", err)
+	}
+	// Repeat the poll on `connection refused` errors, which are usually transient Istio errors.
+	if isConnectionRefused(err) {
+		return true, fmt.Errorf("retrying for connection refused: %w", err)
+	}
+	if isConnectionReset(err) {
+		return true, fmt.Errorf("retrying for connection reset: %w", err)
+	}
+	// Retry on connection/network errors.
+	if errors.Is(err, io.EOF) {
+		return true, fmt.Errorf("retrying for: %w", err)
+	}
+	return false, err
 }
 
 // logZipkinTrace provides support to log Zipkin Trace for param: spoofResponse
@@ -252,14 +274,14 @@ func (sc *SpoofingClient) logZipkinTrace(spoofResp *Response) {
 	}
 
 	traceID := spoofResp.Header.Get(zipkin.ZipkinTraceIDHeader)
-	sc.logf("Logging Zipkin Trace for: %s", traceID)
+	sc.Logf("Logging Zipkin Trace for: %s", traceID)
 
 	json, err := zipkin.JSONTrace(traceID /* We don't know the expected number of spans */, -1, 5*time.Second)
 	if err != nil {
 		if _, ok := err.(*zipkin.TimeoutError); !ok {
-			sc.logf("Error getting zipkin trace: %v", err)
+			sc.Logf("Error getting zipkin trace: %v", err)
 		}
 	}
 
-	sc.logf("%s", json)
+	sc.Logf("%s", json)
 }

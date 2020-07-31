@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Knative Authors
+Copyright 2020 The Knative Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,9 +34,9 @@ type FakeGitHubSources struct {
 	ns   string
 }
 
-var githubsourcesResource = schema.GroupVersionResource{Group: "sources.eventing.knative.dev", Version: "v1alpha1", Resource: "githubsources"}
+var githubsourcesResource = schema.GroupVersionResource{Group: "sources.knative.dev", Version: "v1alpha1", Resource: "githubsources"}
 
-var githubsourcesKind = schema.GroupVersionKind{Group: "sources.eventing.knative.dev", Version: "v1alpha1", Kind: "GitHubSource"}
+var githubsourcesKind = schema.GroupVersionKind{Group: "sources.knative.dev", Version: "v1alpha1", Kind: "GitHubSource"}
 
 // Get takes name of the gitHubSource, and returns the corresponding gitHubSource object, and an error if there is any.
 func (c *FakeGitHubSources) Get(name string, options v1.GetOptions) (result *v1alpha1.GitHubSource, err error) {
@@ -131,7 +131,7 @@ func (c *FakeGitHubSources) DeleteCollection(options *v1.DeleteOptions, listOpti
 // Patch applies the patch and returns the patched gitHubSource.
 func (c *FakeGitHubSources) Patch(name string, pt types.PatchType, data []byte, subresources ...string) (result *v1alpha1.GitHubSource, err error) {
 	obj, err := c.Fake.
-		Invokes(testing.NewPatchSubresourceAction(githubsourcesResource, c.ns, name, data, subresources...), &v1alpha1.GitHubSource{})
+		Invokes(testing.NewPatchSubresourceAction(githubsourcesResource, c.ns, name, pt, data, subresources...), &v1alpha1.GitHubSource{})
 
 	if obj == nil {
 		return nil, err

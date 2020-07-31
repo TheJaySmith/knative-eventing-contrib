@@ -19,6 +19,7 @@ package kafka
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/Shopify/sarama"
 	"go.uber.org/zap"
@@ -31,18 +32,19 @@ type KafkaConsumerHandler interface {
 }
 
 // ConsumerHandler implements sarama.ConsumerGroupHandler and provides some glue code to simplify message handling
-// You must implement KafkaConsumerHandler and create a new saramaConsumerHandler with it
-type saramaConsumerHandler struct {
+// You must implement KafkaConsumerHandler and create a new SaramaConsumerHandler with it
+type SaramaConsumerHandler struct {
 	// The user message handler
 	handler KafkaConsumerHandler
 
 	logger *zap.Logger
 	// Errors channel
-	errors chan error
+	closeErrors sync.Once
+	errors      chan error
 }
 
-func NewConsumerHandler(logger *zap.Logger, handler KafkaConsumerHandler) saramaConsumerHandler {
-	return saramaConsumerHandler{
+func NewConsumerHandler(logger *zap.Logger, handler KafkaConsumerHandler) SaramaConsumerHandler {
+	return SaramaConsumerHandler{
 		logger:  logger,
 		handler: handler,
 		errors:  make(chan error, 10), // Some buffering to avoid blocking the message processing
@@ -50,42 +52,48 @@ func NewConsumerHandler(logger *zap.Logger, handler KafkaConsumerHandler) sarama
 }
 
 // Setup is run at the beginning of a new session, before ConsumeClaim
-func (consumer *saramaConsumerHandler) Setup(sarama.ConsumerGroupSession) error {
+func (consumer *SaramaConsumerHandler) Setup(sarama.ConsumerGroupSession) error {
 	return nil
 }
 
 // Cleanup is run at the end of a session, once all ConsumeClaim goroutines have exited
-func (consumer *saramaConsumerHandler) Cleanup(session sarama.ConsumerGroupSession) error {
-	close(consumer.errors)
+func (consumer *SaramaConsumerHandler) Cleanup(session sarama.ConsumerGroupSession) error {
+	consumer.closeErrors.Do(func() {
+		close(consumer.errors)
+	})
 	return nil
 }
 
 // ConsumeClaim must start a consumer loop of ConsumerGroupClaim's Messages().
-func (consumer *saramaConsumerHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
-	consumer.logger.Info(fmt.Sprintf("Starting Consumer Group Handler, topic: %s", claim.Topic()))
+func (consumer *SaramaConsumerHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	consumer.logger.Info(fmt.Sprintf("Starting partition consumer, topic: %s, partition: %d, initialOffset: %d", claim.Topic(), claim.Partition(), claim.InitialOffset()))
 
 	// NOTE:
 	// Do not move the code below to a goroutine.
 	// The `ConsumeClaim` itself is called within a goroutine, see:
 	// https://github.com/Shopify/sarama/blob/master/consumer_group.go#L27-L29
 	for message := range claim.Messages() {
-		consumer.logger.Debug(fmt.Sprintf("Message claimed: value = %s, timestamp = %v, topic = %s", string(message.Value), message.Timestamp, message.Topic))
+		if ce := consumer.logger.Check(zap.DebugLevel, "debugging"); ce != nil {
+			consumer.logger.Debug("Message claimed", zap.String("topic", message.Topic), zap.Binary("value", message.Value))
+		}
 
 		mustMark, err := consumer.handler.Handle(session.Context(), message)
 
 		if err != nil {
+			consumer.logger.Info("Failure while handling a message", zap.String("topic", message.Topic), zap.Int32("partition", message.Partition), zap.Int64("offset", message.Offset), zap.Error(err))
 			consumer.errors <- err
 		}
 		if mustMark {
 			session.MarkMessage(message, "") // Mark kafka message as processed
-			consumer.logger.Debug(fmt.Sprintf("Message marked: value = %s, timestamp = %v, topic = %s", string(message.Value), message.Timestamp, message.Topic))
+			if ce := consumer.logger.Check(zap.DebugLevel, "debugging"); ce != nil {
+				consumer.logger.Debug("Message marked", zap.String("topic", message.Topic), zap.Binary("value", message.Value))
+			}
 		}
 
 	}
 
-	consumer.logger.Info(fmt.Sprintf("Stopping Consumer Group Handler, topic: %s", claim.Topic()))
-
+	consumer.logger.Info(fmt.Sprintf("Stopping partition consumer, topic: %s, partition: %d", claim.Topic(), claim.Partition()))
 	return nil
 }
 
-var _ sarama.ConsumerGroupHandler = (*saramaConsumerHandler)(nil)
+var _ sarama.ConsumerGroupHandler = (*SaramaConsumerHandler)(nil)

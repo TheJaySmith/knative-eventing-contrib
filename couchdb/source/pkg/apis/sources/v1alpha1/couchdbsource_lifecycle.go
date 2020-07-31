@@ -31,16 +31,17 @@ const (
 
 	// CouchDbConditionDeployed has status True when the CouchDbSource has had it's deployment created.
 	CouchDbConditionDeployed apis.ConditionType = "Deployed"
-
-	// CouchDbConditionEventTypeProvided has status True when the CouchDbSource has been configured with its event types.
-	CouchDbConditionEventTypeProvided apis.ConditionType = "EventTypesProvided"
 )
 
 var CouchDbCondSet = apis.NewLivingConditionSet(
 	CouchDbConditionSinkProvided,
 	CouchDbConditionDeployed,
-	CouchDbConditionEventTypeProvided,
 )
+
+// GetConditionSet retrieves the condition set for this resource. Implements the KRShaped interface.
+func (*CouchDbSource) GetConditionSet() apis.ConditionSet {
+	return CouchDbCondSet
+}
 
 // GetCondition returns the condition currently associated with the given type, or nil.
 func (s *CouchDbSourceStatus) GetCondition(t apis.ConditionType) *apis.Condition {
@@ -53,9 +54,9 @@ func (s *CouchDbSourceStatus) InitializeConditions() {
 }
 
 // MarkSink sets the condition that the source has a sink configured.
-func (s *CouchDbSourceStatus) MarkSink(uri string) {
+func (s *CouchDbSourceStatus) MarkSink(uri *apis.URL) {
 	s.SinkURI = uri
-	if len(uri) > 0 {
+	if !uri.IsEmpty() {
 		CouchDbCondSet.Manage(s).MarkTrue(CouchDbConditionSinkProvided)
 	} else {
 		CouchDbCondSet.Manage(s).MarkUnknown(CouchDbConditionSinkProvided, "SinkEmpty", "Sink has resolved to empty.%s", "")
@@ -77,16 +78,6 @@ func (s *CouchDbSourceStatus) PropagateDeploymentAvailability(d *appsv1.Deployme
 		// for now.
 		CouchDbCondSet.Manage(s).MarkFalse(CouchDbConditionDeployed, "DeploymentUnavailable", "The Deployment '%s' is unavailable.", d.Name)
 	}
-}
-
-// MarkEventTypes sets the condition that the source has set its event type.
-func (s *CouchDbSourceStatus) MarkEventTypes() {
-	CouchDbCondSet.Manage(s).MarkTrue(CouchDbConditionEventTypeProvided)
-}
-
-// MarkNoEventTypes sets the condition that the source does not its event type configured.
-func (s *CouchDbSourceStatus) MarkNoEventTypes(reason, messageFormat string, messageA ...interface{}) {
-	CouchDbCondSet.Manage(s).MarkFalse(CouchDbConditionEventTypeProvided, reason, messageFormat, messageA...)
 }
 
 // IsReady returns true if the resource is ready overall.

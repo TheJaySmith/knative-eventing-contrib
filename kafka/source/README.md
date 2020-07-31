@@ -30,7 +30,7 @@ event sink.
    your source. Below is an example:
 
    ```yaml
-   apiVersion: sources.eventing.knative.dev/v1alpha1
+   apiVersion: sources.knative.dev/v1alpha1
    kind: KafkaSource
    metadata:
      name: kafka-source
@@ -38,12 +38,15 @@ event sink.
      consumerGroup: knative-group
      # Broker URL. Replace this with the URLs for your kafka cluster,
      # which is in the format of my-cluster-kafka-bootstrap.my-kafka-namespace:9092.
-     bootstrapServers: REPLACE_WITH_CLUSTER_URL
-     topics: knative-demo-topic
+     bootstrapServers:
+       - REPLACE_WITH_CLUSTER_URL
+     topics:
+       - knative-demo-topic
      sink:
-       apiVersion: serving.knative.dev/v1alpha1
-       kind: Service
-       name: event-display
+       ref:
+         apiVersion: serving.knative.dev/v1alpha1
+         kind: Service
+         name: event-display
    ```
 
 ## Example

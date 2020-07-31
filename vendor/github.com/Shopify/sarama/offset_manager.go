@@ -58,7 +58,7 @@ func newOffsetManagerFromClient(group, memberID string, generation int32, client
 		client: client,
 		conf:   conf,
 		group:  group,
-		ticker: time.NewTicker(conf.Consumer.Offsets.CommitInterval),
+		ticker: time.NewTicker(conf.Consumer.Offsets.AutoCommit.Interval),
 		poms:   make(map[string]map[int32]*partitionOffsetManager),
 
 		memberID:   memberID,
@@ -233,7 +233,12 @@ func (om *offsetManager) mainLoop() {
 	}
 }
 
+// flushToBroker is ignored if auto-commit offsets is disabled
 func (om *offsetManager) flushToBroker() {
+	if !om.conf.Consumer.Offsets.AutoCommit.Enable {
+		return
+	}
+
 	req := om.constructRequest()
 	if req == nil {
 		return
@@ -275,7 +280,6 @@ func (om *offsetManager) constructRequest() *OffsetCommitRequest {
 			ConsumerID:              om.memberID,
 			ConsumerGroupGeneration: om.generation,
 		}
-
 	}
 
 	om.pomsLock.RLock()
@@ -333,7 +337,6 @@ func (om *offsetManager) handleResponse(broker *Broker, req *OffsetCommitRequest
 				pom.handleError(err)
 			case ErrOffsetsLoadInProgress:
 				// nothing wrong but we didn't commit, we'll get it next time round
-				break
 			case ErrUnknownTopicOrPartition:
 				// let the user know *and* try redispatching - if topic-auto-create is
 				// enabled, redispatching should trigger a metadata req and create the
@@ -576,6 +579,6 @@ func (pom *partitionOffsetManager) handleError(err error) {
 
 func (pom *partitionOffsetManager) release() {
 	pom.releaseOnce.Do(func() {
-		go close(pom.errors)
+		close(pom.errors)
 	})
 }

@@ -18,7 +18,6 @@ package source
 
 import (
 	"context"
-	"strconv"
 
 	"go.opencensus.io/stats/view"
 	"knative.dev/pkg/metrics"
@@ -44,10 +43,12 @@ var (
 	namespaceKey           = tag.MustNewKey(metricskey.LabelNamespaceName)
 	eventSourceKey         = tag.MustNewKey(metricskey.LabelEventSource)
 	eventTypeKey           = tag.MustNewKey(metricskey.LabelEventType)
-	sourceNameKey          = tag.MustNewKey(metricskey.LabelSourceName)
-	sourceResourceGroupKey = tag.MustNewKey(metricskey.LabelSourceResourceGroup)
+	sourceNameKey          = tag.MustNewKey(metricskey.LabelName)
+	sourceResourceGroupKey = tag.MustNewKey(metricskey.LabelResourceGroup)
 	responseCodeKey        = tag.MustNewKey(metricskey.LabelResponseCode)
 	responseCodeClassKey   = tag.MustNewKey(metricskey.LabelResponseCodeClass)
+	responseError          = tag.MustNewKey(metricskey.LabelResponseError)
+	responseTimeout        = tag.MustNewKey(metricskey.LabelResponseTimeout)
 )
 
 type ReportArgs struct {
@@ -56,6 +57,8 @@ type ReportArgs struct {
 	EventSource   string
 	Name          string
 	ResourceGroup string
+	Error         string
+	Timeout       bool
 }
 
 func init() {
@@ -103,8 +106,10 @@ func (r *reporter) generateTag(args *ReportArgs, responseCode int) (context.Cont
 		tag.Insert(eventTypeKey, args.EventType),
 		tag.Insert(sourceNameKey, args.Name),
 		tag.Insert(sourceResourceGroupKey, args.ResourceGroup),
-		tag.Insert(responseCodeKey, strconv.Itoa(responseCode)),
-		tag.Insert(responseCodeClassKey, metrics.ResponseCodeClass(responseCode)))
+		metrics.MaybeInsertIntTag(responseCodeKey, responseCode, responseCode > 0),
+		metrics.MaybeInsertStringTag(responseCodeClassKey, metrics.ResponseCodeClass(responseCode), responseCode > 0),
+		tag.Insert(responseError, args.Error),
+		metrics.MaybeInsertBoolTag(responseTimeout, args.Timeout, args.Error != ""))
 }
 
 func register() {
@@ -115,7 +120,9 @@ func register() {
 		sourceNameKey,
 		sourceResourceGroupKey,
 		responseCodeKey,
-		responseCodeClassKey}
+		responseCodeClassKey,
+		responseError,
+		responseTimeout}
 
 	// Create view to see our measurements.
 	if err := view.Register(

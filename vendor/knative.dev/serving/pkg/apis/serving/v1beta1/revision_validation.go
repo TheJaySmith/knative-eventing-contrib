@@ -18,18 +18,16 @@ package v1beta1
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"knative.dev/pkg/apis"
 	"knative.dev/pkg/kmp"
-	"knative.dev/serving/pkg/apis/autoscaling"
 	"knative.dev/serving/pkg/apis/serving"
 )
 
 // Validate ensures Revision is properly configured.
 func (r *Revision) Validate(ctx context.Context) *apis.FieldError {
-	errs := serving.ValidateObjectMetadata(r.GetObjectMeta()).Also(
+	errs := serving.ValidateObjectMetadata(ctx, r.GetObjectMeta()).Also(
 		r.ValidateLabels().ViaField("labels")).ViaField("metadata")
 	errs = errs.Also(r.Status.Validate(apis.WithinStatus(ctx)).ViaField("status"))
 
@@ -55,89 +53,20 @@ func (r *Revision) Validate(ctx context.Context) *apis.FieldError {
 	return errs
 }
 
-// Validate implements apis.Validatable
-func (rts *RevisionTemplateSpec) Validate(ctx context.Context) *apis.FieldError {
-	errs := rts.Spec.Validate(apis.WithinSpec(ctx)).ViaField("spec")
-	errs = errs.Also(autoscaling.ValidateAnnotations(rts.GetAnnotations()).ViaField("metadata.annotations"))
-
-	// If the RevisionTemplateSpec has a name specified, then check that
-	// it follows the requirements on the name.
-	if rts.Name != "" {
-		var prefix string
-		if om := apis.ParentMeta(ctx); om.Name == "" {
-			prefix = om.GenerateName
-		} else {
-			prefix = om.Name + "-"
-		}
-
-		if !strings.HasPrefix(rts.Name, prefix) {
-			errs = errs.Also(apis.ErrInvalidValue(
-				fmt.Sprintf("%q must have prefix %q", rts.Name, prefix),
-				"metadata.name"))
-		}
-	}
-
-	errs = errs.Also(serving.ValidateQueueSidecarAnnotation(rts.Annotations).ViaField("metadata.annotations"))
-	return errs
-}
-
-// VerifyNameChange checks that if a user brought their own name previously that it
-// changes at the appropriate times.
-func (current *RevisionTemplateSpec) VerifyNameChange(ctx context.Context, og RevisionTemplateSpec) *apis.FieldError {
-	if current.Name == "" {
-		// We only check that Name changes when the RevisionTemplate changes.
-		return nil
-	}
-	if current.Name != og.Name {
-		// The name changed, so we're good.
-		return nil
-	}
-
-	if diff, err := kmp.ShortDiff(&og, current); err != nil {
-		return &apis.FieldError{
-			Message: "Failed to diff RevisionTemplate",
-			Paths:   []string{apis.CurrentField},
-			Details: err.Error(),
-		}
-	} else if diff != "" {
-		return &apis.FieldError{
-			Message: "Saw the following changes without a name change (-old +new)",
-			Paths:   []string{apis.CurrentField},
-			Details: diff,
-		}
-	}
-	return nil
-}
-
-// Validate implements apis.Validatable
-func (rs *RevisionSpec) Validate(ctx context.Context) *apis.FieldError {
-	errs := serving.ValidatePodSpec(rs.PodSpec)
-
-	if rs.TimeoutSeconds != nil {
-		errs = errs.Also(serving.ValidateTimeoutSeconds(ctx, *rs.TimeoutSeconds))
-	}
-
-	if rs.ContainerConcurrency != nil {
-		errs = errs.Also(serving.ValidateContainerConcurrency(rs.ContainerConcurrency).ViaField("containerConcurrency"))
-	}
-
-	return errs
-}
-
-// Validate implements apis.Validatable
-func (rs *RevisionStatus) Validate(ctx context.Context) *apis.FieldError {
-	return nil
-}
-
 // ValidateLabels function validates service labels
 func (r *Revision) ValidateLabels() (errs *apis.FieldError) {
 	for key, val := range r.GetLabels() {
-		switch {
-		case key == serving.RouteLabelKey || key == serving.ServiceLabelKey || key == serving.ConfigurationGenerationLabelKey:
-		case key == serving.ConfigurationLabelKey:
+		switch key {
+		case serving.RouteLabelKey,
+			serving.ServiceLabelKey,
+			serving.ConfigurationGenerationLabelKey:
+			// Known valid labels.
+		case serving.ConfigurationLabelKey:
 			errs = errs.Also(verifyLabelOwnerRef(val, serving.ConfigurationLabelKey, "Configuration", r.GetOwnerReferences()))
-		case strings.HasPrefix(key, serving.GroupNamePrefix):
-			errs = errs.Also(apis.ErrInvalidKeyName(key, ""))
+		default:
+			if strings.HasPrefix(key, serving.GroupNamePrefix) {
+				errs = errs.Also(apis.ErrInvalidKeyName(key, ""))
+			}
 		}
 	}
 	return

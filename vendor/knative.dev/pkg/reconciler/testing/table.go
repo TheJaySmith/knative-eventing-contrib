@@ -79,9 +79,6 @@ type TableRow struct {
 	// WantEvents holds the ordered list of events we expect during reconciliation.
 	WantEvents []string
 
-	// WantServiceReadyStats holds the ServiceReady stats we exepect during reconciliation.
-	WantServiceReadyStats map[string]int
-
 	// WithReactors is a set of functions that are installed as Reactors for the execution
 	// of this row of the table-driven-test.
 	WithReactors []clientgotesting.ReactionFunc
@@ -89,24 +86,53 @@ type TableRow struct {
 	// For cluster-scoped resources like ClusterIngress, it does not have to be
 	// in the same namespace with its child resources.
 	SkipNamespaceValidation bool
+
+	// PostConditions allows custom assertions to be made after reconciliation
+	PostConditions []func(*testing.T, *TableRow)
+
+	// Reconciler holds the controller.Reconciler that was used to evaluate this row.
+	// It is populated here to make it accessible to PostConditions.
+	Reconciler controller.Reconciler
+
+	// OtherTestData is arbitrary data needed for the test. It is not used directly by the table
+	// testing framework. Instead it is used in the test method. E.g. setting up the responses for a
+	// mock client can go in here.
+	OtherTestData map[string]interface{}
+
+	CmpOpts []cmp.Option
 }
 
 func objKey(o runtime.Object) string {
 	on := o.(kmeta.Accessor)
+
+	var typeOf string
+	if gvk := on.GroupVersionKind(); gvk.Group != "" {
+		// This must be populated if we're dealing with unstructured.Unstructured.
+		typeOf = gvk.String()
+	} else if or, ok := on.(kmeta.OwnerRefable); ok {
+		// This is typically implemented by Knative resources.
+		typeOf = or.GetGroupVersionKind().String()
+	} else {
+		// Worst case, fallback on a non-GVK string.
+		typeOf = reflect.TypeOf(o).String()
+	}
+
 	// namespace + name is not unique, and the tests don't populate k8s kind
 	// information, so use GoLang's type name as part of the key.
-	return path.Join(reflect.TypeOf(o).String(), on.GetNamespace(), on.GetName())
+	return path.Join(typeOf, on.GetNamespace(), on.GetName())
 }
 
-// Factory returns a Reconciler.Interface to perform reconciliation in table test,
-// ActionRecorderList/EventList to capture k8s actions/events produced during reconciliation
-// and FakeStatsReporter to capture stats.
-type Factory func(*testing.T, *TableRow) (controller.Reconciler, ActionRecorderList, EventList, *FakeStatsReporter)
+// Factory returns a Reconciler.Interface to perform reconciliation in table test, and
+// ActionRecorderList/EventList to capture k8s actions/events produced during reconciliation.
+type Factory func(*testing.T, *TableRow) (controller.Reconciler, ActionRecorderList, EventList)
 
 // Test executes the single table test.
 func (r *TableRow) Test(t *testing.T, factory Factory) {
 	t.Helper()
-	c, recorderList, eventList, statsReporter := factory(t, r)
+	c, recorderList, eventList := factory(t, r)
+
+	// Set the Reconciler for PostConditions to access it post-Reconcile()
+	r.Reconciler = c
 
 	// Set context to not be nil.
 	ctx := r.Ctx
@@ -151,7 +177,7 @@ func (r *TableRow) Test(t *testing.T, factory Factory) {
 			t.Errorf("Unexpected action[%d]: %#v", i, got)
 		}
 
-		if diff := cmp.Diff(want, obj, ignoreLastTransitionTime, safeDeployDiff, cmpopts.EquateEmpty()); diff != "" {
+		if diff := cmp.Diff(want, obj, append(r.CmpOpts, ignoreLastTransitionTime, safeDeployDiff, cmpopts.EquateEmpty())...); diff != "" {
 			t.Errorf("Unexpected create (-want, +got): %s", diff)
 		}
 	}
@@ -172,7 +198,7 @@ func (r *TableRow) Test(t *testing.T, factory Factory) {
 				continue
 			}
 			t.Errorf("Missing update for %s (-want, +prevState): %s", key,
-				cmp.Diff(wo, oldObj, ignoreLastTransitionTime, safeDeployDiff, cmpopts.EquateEmpty()))
+				cmp.Diff(wo, oldObj, append(r.CmpOpts, ignoreLastTransitionTime, safeDeployDiff, cmpopts.EquateEmpty())...))
 			continue
 		}
 
@@ -185,7 +211,7 @@ func (r *TableRow) Test(t *testing.T, factory Factory) {
 		// Update the object state.
 		objPrevState[objKey(got)] = got
 
-		if diff := cmp.Diff(want.GetObject(), got, ignoreLastTransitionTime, safeDeployDiff, cmpopts.EquateEmpty()); diff != "" {
+		if diff := cmp.Diff(want.GetObject(), got, append(r.CmpOpts, ignoreLastTransitionTime, safeDeployDiff, cmpopts.EquateEmpty())...); diff != "" {
 			t.Errorf("Unexpected update (-want, +got): %s", diff)
 		}
 	}
@@ -207,7 +233,7 @@ func (r *TableRow) Test(t *testing.T, factory Factory) {
 				continue
 			}
 			t.Errorf("Missing status update for %s (-want, +prevState): %s", key,
-				cmp.Diff(wo, oldObj, ignoreLastTransitionTime, safeDeployDiff, cmpopts.EquateEmpty()))
+				cmp.Diff(wo, oldObj, append(r.CmpOpts, ignoreLastTransitionTime, safeDeployDiff, cmpopts.EquateEmpty())...))
 			continue
 		}
 
@@ -216,7 +242,7 @@ func (r *TableRow) Test(t *testing.T, factory Factory) {
 		// Update the object state.
 		objPrevState[objKey(got)] = got
 
-		if diff := cmp.Diff(want.GetObject(), got, ignoreLastTransitionTime, safeDeployDiff, cmpopts.EquateEmpty()); diff != "" {
+		if diff := cmp.Diff(want.GetObject(), got, append(r.CmpOpts, ignoreLastTransitionTime, safeDeployDiff, cmpopts.EquateEmpty())...); diff != "" {
 			t.Errorf("Unexpected status update (-want, +got): %s\nFull: %v", diff, got)
 		}
 	}
@@ -230,7 +256,7 @@ func (r *TableRow) Test(t *testing.T, factory Factory) {
 				continue
 			}
 			t.Errorf("Extra status update for %s (-extra, +prevState): %s", key,
-				cmp.Diff(wo, oldObj, ignoreLastTransitionTime, safeDeployDiff, cmpopts.EquateEmpty()))
+				cmp.Diff(wo, oldObj, append(r.CmpOpts, ignoreLastTransitionTime, safeDeployDiff, cmpopts.EquateEmpty())...))
 		}
 	}
 
@@ -297,7 +323,9 @@ func (r *TableRow) Test(t *testing.T, factory Factory) {
 		if got.GetName() != want.GetName() {
 			t.Errorf("Unexpected patch[%d]: %#v", i, got)
 		}
-		if !r.SkipNamespaceValidation && got.GetNamespace() != expectedNamespace {
+		if (!r.SkipNamespaceValidation && got.GetNamespace() != expectedNamespace) &&
+			(!r.SkipNamespaceValidation && got.GetResource().GroupResource().Resource != "namespaces" &&
+				got.GetName() != expectedNamespace) {
 			t.Errorf("Unexpected patch[%d]: %#v", i, got)
 		}
 		if diff := cmp.Diff(string(want.GetPatch()), string(got.GetPatch())); diff != "" {
@@ -327,9 +355,8 @@ func (r *TableRow) Test(t *testing.T, factory Factory) {
 		}
 	}
 
-	gotStats := statsReporter.GetServiceReadyStats()
-	if diff := cmp.Diff(r.WantServiceReadyStats, gotStats); diff != "" {
-		t.Errorf("Unexpected service ready stats (-want, +got): %s", diff)
+	for _, verify := range r.PostConditions {
+		verify(t, r)
 	}
 }
 

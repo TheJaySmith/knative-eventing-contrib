@@ -37,6 +37,9 @@ rules:
     verbs:
       - "get"
       - "create"
+      - "list"
+      - "watch"
+      - "update"
 
   # For getting our Deployment so we can decorate with ownerref.
   - apiGroups:
@@ -58,7 +61,8 @@ rules:
       - "admissionregistration.k8s.io"
     resources:
       - "mutatingwebhookconfigurations"
-    verbs:
+      - "validatingwebhookconfigurations"
+    verbs: &everything
       - "get"
       - "list"
       - "create"
@@ -77,3 +81,26 @@ rules:
       - "get"
       - "list"
       - "watch"
+
+  # For leader election
+  - apiGroups:
+      - "coordination.k8s.io"
+    resources:
+      - "leases"
+    verbs: *everything
+
+  # Necessary for conversion webhook. These are copied from the serving
+  # TODO: Do we really need all these permissions?
+  - apiGroups:
+      - "apiextensions.k8s.io"
+    resources:
+      - "customresourcedefinitions"
+    verbs:
+      - "get"
+      - "list"
+      - "create"
+      - "update"
+      - "delete"
+      - "patch"
+      - "watch"
+
